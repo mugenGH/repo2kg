@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "repo2kg"
+version = "0.3.0"
+description = "Build a code Knowledge Graph from any Python repository for token-efficient AI agent context. Agent-friendly: generates CLAUDE.md, CODEBASE.md, and supports zero-dep queries."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [{ name = "repo2kg contributors" }]
+keywords = ["knowledge-graph", "code-analysis", "llm", "ai-agent", "token-optimization", "rag"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Code Generators",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+dependencies = [
+    "numpy>=1.24",
+    "faiss-cpu>=1.7",
+    "sentence-transformers>=2.2",
+]
+
+[project.scripts]
+repo2kg = "repo2kg:main"
+
+[project.urls]
+Homepage = "https://github.com/shreeramktm2004/code-knowledge-graph"
+Issues = "https://github.com/shreeramktm2004/code-knowledge-graph/issues"
