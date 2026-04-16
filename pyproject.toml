@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "repo2kg"
-version = "0.3.0"
-description = "Build a code Knowledge Graph from any Python repository for token-efficient AI agent context. Agent-friendly: generates CLAUDE.md, CODEBASE.md, and supports zero-dep queries."
+version = "0.5.0"
+description = "Build a code Knowledge Graph from any repository (Python/JS/TS/Java/Go/Rust/C/C++/Ruby/C#) for token-efficient AI agent context. Supports JSON, TOML, and TOON output formats. Agent-friendly: generates CLAUDE.md, CODEBASE.md, and supports zero-dep queries."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
@@ -27,6 +27,9 @@ dependencies = [
     "faiss-cpu>=1.7",
     "sentence-transformers>=2.2",
 ]
+
+[project.optional-dependencies]
+toml = ["tomli>=2.0; python_version < '3.11'"]
 
 [project.scripts]
 repo2kg = "repo2kg:main"
