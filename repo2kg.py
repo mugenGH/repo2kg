@@ -32,7 +32,7 @@ Format auto-detection:
   FAISS sidecar files (.faiss, .idx) use the base name regardless of format
 """
 
-__version__ = "0.5.3"
+__version__ = "0.5.4"
 
 import os
 import sys

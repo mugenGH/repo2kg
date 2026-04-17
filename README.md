@@ -120,11 +120,7 @@ repo2kg query-lite "how does authentication work" --kg kg.json
 ## Installation
 
 ```bash
-# Standard install (CPU only, no CUDA needed)
 pip install repo2kg
-
-# With tree-sitter for more accurate parsing (recommended)
-pip install "repo2kg[treesitter]"
 ```
 
 **Requirements:** Python 3.10+
@@ -135,6 +131,7 @@ pip install "repo2kg[treesitter]"
 | `numpy` | ~20 MB | build, query |
 | `faiss-cpu` | ~60 MB | build, query (CPU only, no GPU/CUDA needed) |
 | `sentence-transformers` | ~2 GB (PyTorch) | build, query |
+| `tree-sitter` + 9 grammars | ~10 MB | build (AST parsing) |
 
 > **Note:** `query-lite`, `user-setup`, `export`, `agent-setup`, `list`, and `register` all start **instantly** — they never load PyTorch or FAISS. Only `build` and `query` load the heavy dependencies.
 
@@ -295,23 +292,19 @@ def JWTService.verify_token(self, token: str) -> dict:
 
 ---
 
-## Tree-Sitter Parsing (More Accurate)
+## Tree-Sitter Parsing
 
-By default, repo2kg uses **regex-based parsers** for non-Python languages. Install tree-sitter grammars for **AST-accurate parsing**:
+repo2kg uses **tree-sitter** for all non-Python languages — installed automatically with `pip install repo2kg`. No extra steps needed.
 
-```bash
-pip install "repo2kg[treesitter]"
-```
+| Advantage over regex | Detail |
+|---|---|
+| Multi-line signatures | Captured correctly |
+| Nested classes | Exact parent class |
+| Code in strings/comments | Ignored (no false matches) |
+| Generic types `List<T>` | Handled correctly |
+| Arrow functions in classes | Correct method detection |
 
-| Problem | Regex | Tree-sitter |
-|---|---|---|
-| Multi-line signatures | ✗ Often misses | ✓ Correct |
-| Nested classes | ✗ Wrong parent | ✓ Exact parent |
-| Code in strings/comments | ✗ False matches | ✓ Ignored |
-| Generic types `List<T>` | ✗ Breaks | ✓ Handles |
-| Arrow functions in classes | ✗ Often wrong | ✓ Correct |
-
-Tree-sitter is **optional** — if not installed, repo2kg silently falls back to regex. Python always uses Python's own `ast` module (always accurate).
+Python always uses Python's own `ast` module. If tree-sitter fails for any file, repo2kg silently falls back to regex.
 
 ---
 
@@ -496,9 +489,6 @@ Contributions welcome! Open an issue first for major changes.
 git clone https://github.com/mugenGH/repo2kg.git
 cd repo2kg
 pip install -e .
-
-# With tree-sitter support
-pip install -e ".[treesitter]"
 ```
 
 ---

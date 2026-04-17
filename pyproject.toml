@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "repo2kg"
-version = "0.5.3"
+version = "0.5.4"
 description = "Build a code Knowledge Graph from any repository (Python/JS/TS/Java/Go/Rust/C/C++/Ruby/C#) for token-efficient AI agent context. Supports JSON and TOON output formats. Agent-friendly: generates CLAUDE.md, CODEBASE.md, and supports zero-dep queries."
 readme = "README.md"
 license = "MIT"
@@ -26,10 +26,6 @@ dependencies = [
     "numpy>=1.24",
     "faiss-cpu>=1.7",
     "sentence-transformers>=2.2",
-]
-
-[project.optional-dependencies]
-treesitter = [
     "tree-sitter>=0.21",
     "tree-sitter-javascript>=0.21",
     "tree-sitter-typescript>=0.21",
@@ -46,5 +42,5 @@ treesitter = [
 repo2kg = "repo2kg:main"
 
 [project.urls]
-Homepage = "https://github.com/shreeramktm2004/code-knowledge-graph"
-Issues = "https://github.com/shreeramktm2004/code-knowledge-graph/issues"
+Homepage = "https://github.com/mugenGH/repo2kg"
+Issues = "https://github.com/mugenGH/repo2kg/issues"
