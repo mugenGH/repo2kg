@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "repo2kg"
-version = "0.5.0"
-description = "Build a code Knowledge Graph from any repository (Python/JS/TS/Java/Go/Rust/C/C++/Ruby/C#) for token-efficient AI agent context. Supports JSON, TOML, and TOON output formats. Agent-friendly: generates CLAUDE.md, CODEBASE.md, and supports zero-dep queries."
+version = "0.5.3"
+description = "Build a code Knowledge Graph from any repository (Python/JS/TS/Java/Go/Rust/C/C++/Ruby/C#) for token-efficient AI agent context. Supports JSON and TOON output formats. Agent-friendly: generates CLAUDE.md, CODEBASE.md, and supports zero-dep queries."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
@@ -29,7 +29,18 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-toml = ["tomli>=2.0; python_version < '3.11'"]
+treesitter = [
+    "tree-sitter>=0.21",
+    "tree-sitter-javascript>=0.21",
+    "tree-sitter-typescript>=0.21",
+    "tree-sitter-java>=0.21",
+    "tree-sitter-go>=0.21",
+    "tree-sitter-rust>=0.21",
+    "tree-sitter-c>=0.21",
+    "tree-sitter-cpp>=0.21",
+    "tree-sitter-ruby>=0.21",
+    "tree-sitter-c-sharp>=0.21",
+]
 
 [project.scripts]
 repo2kg = "repo2kg:main"
