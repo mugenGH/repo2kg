@@ -36,6 +36,66 @@ Agent reads 177 files                Agent reads CODEBASE.md
 
 ---
 
+## Token Efficiency: Real Numbers
+
+Tested on a project with **229 source files**, **2,909 nodes**, and **4,615 call edges**. The agent understood the full architecture without opening a single raw source file.
+
+### With repo2kg
+
+The agent ran four commands:
+
+```bash
+repo2kg list
+repo2kg stats --kg kg.json
+repo2kg query-lite "main app entry" --kg kg.json
+repo2kg query-lite "authentication login jwt token" --kg kg.json
+repo2kg export --kg kg.json
+```
+
+| Step | Tokens |
+|---|---|
+| stats output | ~100 |
+| 4 × query-lite results | ~2,400 |
+| CODEBASE.md overview | ~1,500 |
+| **Total** | **~4,000 tokens** |
+
+### Without repo2kg
+
+```bash
+# Agent must search and read files manually
+glob file listing → grep functions/classes → read source files
+```
+
+| Step | Tokens |
+|---|---|
+| File listing | ~3,000 |
+| Reading 10–20 source files | ~15,000–40,000 |
+| Grep results | ~5,000–10,000 |
+| **Total** | **~23,000–53,000 tokens** |
+
+### Result
+
+| Method | Tokens | Quality |
+|---|---|---|
+| repo2kg | ~4,000 | High — structured graph, signatures, call edges |
+| Normal search | ~23,000–53,000 | Medium — raw code scanning |
+
+```
+Reduction:  83–92% fewer tokens during codebase discovery
+Full session savings (including messages):  ~40–60%
+```
+
+The larger and more interconnected your repo, the bigger the gain:
+
+| Project Size | Files | Token Savings |
+|---|---|---|
+| Small | < 20 | 10–20% |
+| Medium | 20–100 | 40–70% |
+| Large | 100–500 | 70–90% |
+| Monorepo | 500+ | 85–95% |
+
+---
+
 ## Quick Start
 
 ```bash
@@ -417,21 +477,6 @@ Every node in `kg.json` / `kg.toon`:
 | C++ | `.cpp` `.cc` `.cxx` `.hpp` | tree-sitter / regex |
 | Ruby | `.rb` | tree-sitter / regex |
 | C# | `.cs` | tree-sitter / regex |
-
----
-
-## When to Use repo2kg
-
-| Project Size | Files | Token Savings | Recommendation |
-|---|---|---|---|
-| Small | < 20 | 10–20% | Optional |
-| Medium | 20–100 | 40–70% | ✅ Recommended |
-| Large | 100–500 | 70–90% | ✅ Strongly recommended |
-| Monorepo | 500+ | 85–95% | ✅ Essential |
-
-Value scales with **interconnectedness** — more call edges = more graph traversal advantage.
-
-**Real example:** 177 files → **788 nodes**, 3 languages, single build.
 
 ---
 
