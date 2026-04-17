@@ -112,7 +112,7 @@ repo2kg build --repo . --out kg.json
 repo2kg agent-setup --kg kg.json --dir .
 
 # 4. Query it
-repo2kg query-lite "how does authentication work" --kg kg.json
+repo2kg query "how does authentication work" --kg kg.json
 ```
 
 ---
