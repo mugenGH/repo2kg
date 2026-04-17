@@ -26,8 +26,8 @@ Every time you ask Claude Code, Copilot, or Codex to work on your project, it re
 ```
 Without repo2kg                      With repo2kg
 ────────────────────                 ─────────────────────
-Agent reads 177 files                Agent reads CODEBASE.md
-→ 43,000 tokens used                 → 8,900 tokens (80% saved)
+Agent reads 229 files                Agent reads CODEBASE.md
+→ ~53,000+ tokens used               → ~4,000 tokens (85%-95% saved)
 → Slow, hits context limits          → Fast, precise, relevant
 → New session = start over           → KG persists forever
 ```
