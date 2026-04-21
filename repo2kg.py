@@ -7,18 +7,19 @@ Architecture:
   Output        — token-minimal structured context for LLM agents
   Formats       — JSON (default) or TOON (token-optimized)
 
-Usage:
-  repo2kg build --repo ./myrepo --out kg.json     # JSON output
-  repo2kg build --repo ./myrepo --out kg.toon     # TOON output (40% fewer tokens)
-  repo2kg query "how does authentication work" --kg kg.json --depth 2
-  repo2kg stats --kg kg.json
-  repo2kg info                                    # Machine-readable tool info (JSON)
+Recommended agent workflow (minimal tokens):
+  repo2kg build --repo . --out kg.toon            # 1. Build KG (TOON = 40% fewer tokens)
+  repo2kg summary --kg kg.toon                    # 2. Compact map (~10k tokens) — orientation
+  repo2kg query "how does auth work" --kg kg.toon # 3. Targeted semantic search (~400 tokens/query)
+  repo2kg query-lite "login" --kg kg.toon         # 3b. Keyword search (no deps, instant)
 
-Agent-friendly commands (no FAISS/embeddings needed):
-  repo2kg export --kg kg.json --out CODEBASE.md      # standalone markdown for agents
-  repo2kg agent-setup --kg kg.json --dir ./myrepo     # generate CLAUDE.md + .copilot-instructions.md
-  repo2kg query-lite "auth" --kg kg.json              # keyword search, zero heavy deps
-  repo2kg info                                        # JSON tool description for agent discovery
+Agent setup commands:
+  repo2kg agent-setup --kg kg.toon --dir .        # generate CLAUDE.md + .copilot-instructions.md
+  repo2kg info                                    # JSON tool description for agent discovery
+
+Full export (use only when you need everything):
+  repo2kg export --kg kg.toon --out CODEBASE.md   # full dump — ~60k tokens for large projects
+  repo2kg summary --kg kg.toon --out SUMMARY.md   # compact alternative — ~10k tokens
 
 User-level (global, across all projects):
   repo2kg user-setup                                  # install global agent instructions once
@@ -3526,27 +3527,34 @@ def _print_banner():
 
 _CLI_EPILOG = """\
 ──────────────────────────────────────────────────────────────────────
-Quick Start:
-  repo2kg build --repo . --out kg.json       # Build from current dir (JSON)
-  repo2kg build --repo . --out kg.toon       # Build from current dir (TOON, 40% fewer tokens)
-  repo2kg query-lite "auth" --kg kg.json     # Keyword search (no heavy deps)
-  repo2kg query "how does auth work" --kg kg.json  # Semantic search (FAISS)
-  repo2kg export --kg kg.json                # Generate CODEBASE.md
-  repo2kg agent-setup --kg kg.json --dir .   # Full agent file setup
+Recommended Agent Workflow (minimal token cost):
+  repo2kg build --repo . --out kg.toon       # 1. Build KG
+  repo2kg summary --kg kg.toon               # 2. Orientation map (~10k tokens)
+  repo2kg query "auth flow" --kg kg.toon     # 3. Deep dive (~400 tokens/query)
+  repo2kg query-lite "login" --kg kg.toon    # 3b. Instant keyword search (no ML)
+
+  Total: ~11k tokens vs ~60k for a full export — 83% savings.
+
+Agent Setup:
+  repo2kg agent-setup --kg kg.toon --dir .   # CLAUDE.md + .copilot-instructions.md
+  repo2kg user-setup                         # Global agent instructions (run once)
+
+Discovery:
+  repo2kg scan --root ~                      # Auto-discover all KGs under home
+  repo2kg list                               # Show registered projects
   repo2kg info                               # Machine-readable tool info (JSON)
+
+Full Export (only when you need everything):
+  repo2kg export --kg kg.toon --out CODEBASE.md  # ~60k tokens — use sparingly
+  repo2kg summary --kg kg.toon --out SUMMARY.md  # ~10k tokens — preferred
 
 Formats:
   .json  — Default. Compact, fast, universal.
   .toon  — Token-Oriented Object Notation. ~40% fewer tokens than JSON.
-           Best for LLM context windows. Spec: github.com/toon-format
+           Best for LLM context windows.
 
 Languages:
   Python, JavaScript, TypeScript, Java, Go, Rust, C, C++, Ruby, C#
-
-Agent Integration:
-  repo2kg user-setup                         # Install global agent instructions
-  repo2kg scan --root ~                      # Auto-discover all KGs
-  repo2kg list                               # Show registered projects
 ──────────────────────────────────────────────────────────────────────
 """
 
@@ -3596,7 +3604,17 @@ def main():
                          help="Output format: text (default) or json")
 
     # ── export (generate CODEBASE.md) ──
-    export_p = sub.add_parser("export", help="Export KG as agent-readable CODEBASE.md")
+    export_p = sub.add_parser(
+        "export",
+        help="Export full KG as CODEBASE.md (~60k tokens for large projects — use 'summary' instead for agents)",
+        description=(
+            "Generates a complete CODEBASE.md with every symbol, signature, docstring, "
+            "call graph, and entry points.\n\n"
+            "WARNING: For large projects (100+ files) this can exceed 60,000 tokens — "
+            "larger than many LLM context budgets. Prefer 'repo2kg summary' (~10k tokens) "
+            "for agent orientation, then use 'repo2kg query' for targeted deep dives."
+        ),
+    )
     export_p.add_argument("--kg", default="kg.json",
                           help="Path to saved KG .json/.toon (default: kg.json)")
     export_p.add_argument("--out", default="CODEBASE.md",
