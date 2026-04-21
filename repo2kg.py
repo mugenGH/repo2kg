@@ -32,7 +32,7 @@ Format auto-detection:
   FAISS sidecar files (.faiss, .idx) use the base name regardless of format
 """
 
-__version__ = "0.5.12"
+__version__ = "0.5.13"
 
 import os
 import sys
@@ -71,12 +71,38 @@ REPO2KG_HOME = Path.home() / ".repo2kg"
 REGISTRY_PATH = REPO2KG_HOME / "registry.json"
 
 DEFAULT_EXCLUDE = [
+    # VCS / tooling
     "__pycache__", ".git", ".hg", ".svn",
-    "node_modules", ".tox", ".nox", ".mypy_cache",
-    ".pytest_cache", ".ruff_cache", "*.egg-info",
+    ".tox", ".nox", ".mypy_cache", ".pytest_cache", ".ruff_cache",
+    "*.egg-info",
+    # Virtual environments
     "venv", ".venv", "env", ".env",
-    "dist", "build", "site-packages",
+    # Build / bundler outputs  ← these produce generated/minified code
+    "dist", "build", "out", "coverage",
+    ".next", ".nuxt", ".output",
+    ".vite", "__sapper__",
+    # Dependency folders
+    "node_modules", "vendor", "site-packages", "bower_components",
 ]
+
+# File-level patterns filtered during build (checked against the full relative path)
+_EXCLUDE_FILE_PATTERNS = (
+    ".min.js",
+    ".min.css",
+    ".bundle.js",
+    ".chunk.js",
+    ".generated.",
+    ".pb.go",        # protobuf generated
+    "_pb2.py",       # protobuf generated (Python)
+    ".g.dart",       # generated Dart
+    ".freezed.dart", # generated Dart
+    "chunk-",        # Vite chunk files like chunk-ABCD1234.js
+)
+
+def _is_generated_file(fpath: str) -> bool:
+    """Return True if the file looks like a build artifact or generated file."""
+    name = os.path.basename(fpath).lower()
+    return any(pat in name for pat in _EXCLUDE_FILE_PATTERNS)
 
 # Marker pair used to identify repo2kg-managed sections in shared files.
 # Content between these markers is replaced on re-run; content outside is preserved.
@@ -1655,6 +1681,8 @@ class RepoKG:
                 ext = os.path.splitext(f)[1].lower()
                 if ext in supported_exts:
                     fpath = os.path.join(root, f)
+                    if _is_generated_file(fpath):
+                        continue
                     source_files.append(fpath)
                     lang = LANG_EXTENSIONS[ext]
                     lang_counts[lang] = lang_counts.get(lang, 0) + 1
@@ -2154,10 +2182,14 @@ def generate_visual_graph(kg_path: str, out_path: str, max_nodes: int = 800) -> 
 
     # ── Filter to user-written code only (drop 3rd-party / bundled files) ──
     _THIRD_PARTY_PATTERNS = (
-        ".vite/deps/",
+        ".vite/", "/.vite/",
         "node_modules/",
         "site-packages/",
-        "/dist/",
+        "/dist/", "\\dist\\",
+        "/build/", "\\build\\",
+        "/.next/", "/.nuxt/",
+        "/out/", "/coverage/",
+        "/vendor/",
         "/.cache/",
         "<builtin",
         "<frozen",

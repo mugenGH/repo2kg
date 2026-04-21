@@ -402,8 +402,20 @@ repo2kg info         Print machine-readable tool info (for agents)
 ### Auto-excluded directories
 
 ```
-__pycache__  .git  node_modules  .tox  .venv  venv  env
-.mypy_cache  .pytest_cache  dist  build  site-packages
+__pycache__  .git  .hg  .svn  .tox  .nox  .mypy_cache  .pytest_cache
+node_modules  vendor  bower_components  site-packages
+dist  build  out  coverage  .next  .nuxt  .output  .vite  __sapper__
+venv  .venv  env  .env
+```
+
+### Auto-excluded file patterns
+
+Files matching these patterns are skipped even inside user source directories:
+
+```
+*.min.js   *.min.css   *.bundle.js   *.chunk.js
+*.generated.*  chunk-*.js   *_pb2.py   *.pb.go
+*.g.dart   *.freezed.dart
 ```
 
 Add more: `repo2kg build --repo . --exclude migrations fixtures`
