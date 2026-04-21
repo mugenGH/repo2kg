@@ -32,7 +32,7 @@ Format auto-detection:
   FAISS sidecar files (.faiss, .idx) use the base name regardless of format
 """
 
-__version__ = "0.5.4"
+__version__ = "0.5.12"
 
 import os
 import sys
@@ -2019,7 +2019,7 @@ def export_codebase_md(kg_path: str, out_path: str):
             f"`{n.name}`" + (f" ({n.kind})" if n.kind == "class" else "")
             for n in sorted(fnodes, key=lambda x: (x.kind != "class", x.name))
         )
-        lines.append(f"- **{fpath}** — {node_names}")
+        lines.append(f"- **{fpath}** -- {node_names}")
     lines.append("")
 
     # Architecture: group by top-level directory
@@ -2089,7 +2089,7 @@ def export_codebase_md(kg_path: str, out_path: str):
     if entry_candidates:
         lines.extend(["## Likely Entry Points", ""])
         for n in sorted(entry_candidates, key=lambda x: -len(x.calls))[:15]:
-            lines.append(f"- `{n.name}` in {n.file} — calls {len(n.calls)} functions")
+            lines.append(f"- `{n.name}` in {n.file} -- calls {len(n.calls)} functions")
         lines.append("")
 
     # Signatures reference (compact)
@@ -2106,7 +2106,7 @@ def export_codebase_md(kg_path: str, out_path: str):
     lines.append("")
 
     content = "\n".join(lines)
-    with open(out_path, "w") as f:
+    with open(out_path, "w", encoding="utf-8") as f:
         f.write(content)
     token_estimate = len(content.split())
     print(f"Exported {out_path} ({len(nodes)} nodes, ~{token_estimate} tokens)")
@@ -2116,21 +2116,34 @@ def export_codebase_md(kg_path: str, out_path: str):
 # VISUAL GRAPH (interactive HTML for humans)
 # ─────────────────────────────────────────────
 
+_D3_CDN = "https://d3js.org/d3.v7.min.js"
+_D3_CACHE_PATH = REPO2KG_HOME / "d3.v7.min.js"
+
+
+def _get_d3_script() -> str:
+    """Return D3 v7 as an inline <script> block. Caches locally after first download."""
+    # Use cached copy if available
+    if _D3_CACHE_PATH.exists():
+        return f"<script>\n{_D3_CACHE_PATH.read_text(encoding='utf-8')}\n</script>"
+    # Try to download and cache
+    try:
+        import urllib.request
+        print("Downloading D3.js for offline use (cached to ~/.repo2kg/d3.v7.min.js)…")
+        with urllib.request.urlopen(_D3_CDN, timeout=15) as resp:  # noqa: S310
+            js = resp.read().decode("utf-8")
+        _D3_CACHE_PATH.write_text(js, encoding="utf-8")
+        return f"<script>\n{js}\n</script>"
+    except Exception:
+        # Fall back to CDN link — graph will need internet to render
+        print("Warning: could not download D3.js; falling back to CDN (requires internet).")
+        return f'<script src="{_D3_CDN}"></script>'
+
+
 def generate_visual_graph(kg_path: str, out_path: str, max_nodes: int = 800) -> None:
     """
     Generate a self-contained interactive HTML knowledge-graph visualization.
 
-    Opens in any browser — no server needed.  Uses D3 v7 (CDN) for a
-    force-directed layout with:
-      • Node colours by kind  (class=blue / function=green / method=orange)
-      • Directed call edges with arrow heads
-      • Hover tooltip  — name, kind, file, docstring, signature, calls
-      • Click to highlight a node and its direct neighbours
-      • Keyword search box — filters visible nodes in real time
-      • Filter buttons  — toggle classes / functions / methods
-      • Drag-to-pin, zoom, pan
-
-    Large KGs (>max_nodes nodes) are capped: the most-connected nodes are kept.
+    Opens in any browser — no server needed.  Uses D3 v7 (inlined, no CDN required).
     """
     fmt = _detect_format(kg_path)
     with open(kg_path) as f:
@@ -2138,6 +2151,25 @@ def generate_visual_graph(kg_path: str, out_path: str, max_nodes: int = 800) -> 
 
     nodes_dict = {nid: CodeNode(**nd) for nid, nd in data.items()}
     title = os.path.splitext(os.path.basename(kg_path))[0]
+
+    # ── Filter to user-written code only (drop 3rd-party / bundled files) ──
+    _THIRD_PARTY_PATTERNS = (
+        ".vite/deps/",
+        "node_modules/",
+        "site-packages/",
+        "/dist/",
+        "/.cache/",
+        "<builtin",
+        "<frozen",
+        "<string>",
+    )
+    def _is_user_file(filepath: str) -> bool:
+        if not filepath:
+            return False
+        fp = filepath.replace("\\", "/")
+        return not any(pat in fp for pat in _THIRD_PARTY_PATTERNS)
+
+    nodes_dict = {nid: n for nid, n in nodes_dict.items() if _is_user_file(n.file)}
 
     # If the KG is very large, keep the top max_nodes most-connected nodes.
     if len(nodes_dict) > max_nodes:
@@ -2152,7 +2184,29 @@ def generate_visual_graph(kg_path: str, out_path: str, max_nodes: int = 800) -> 
 
     keep_ids = set(nodes_dict.keys())
 
+    # ── Build file hub nodes (one big node per unique source file) ──────────
+    file_map: dict[str, str] = {}   # file_path → synthetic file-node id
+    for n in nodes_dict.values():
+        if n.file not in file_map:
+            file_map[n.file] = f"__file__{n.file}"
+
     nodes_json: list[dict] = []
+    # File hub nodes first
+    for fpath, fid in file_map.items():
+        sym_count = sum(1 for n in nodes_dict.values() if n.file == fpath)
+        nodes_json.append({
+            "id": fid,
+            "name": os.path.basename(fpath),
+            "kind": "file",
+            "file": fpath,
+            "parent_class": "",
+            "signature": fpath,
+            "docstring": f"{sym_count} symbols",
+            "calls": [],
+            "callers": [],
+            "sym_count": sym_count,
+        })
+    # Symbol nodes (class / function / method)
     for n in nodes_dict.values():
         nodes_json.append({
             "id": n.id,
@@ -2164,9 +2218,16 @@ def generate_visual_graph(kg_path: str, out_path: str, max_nodes: int = 800) -> 
             "docstring": (n.docstring or "")[:250],
             "calls": [c.split("::")[-1] for c in n.calls[:8]],
             "callers": [c.split("::")[-1] for c in n.callers[:8]],
+            "sym_count": 0,
         })
 
     links_json: list[dict] = []
+    # Containment links: file hub → each of its symbols  (ltype "c")
+    for n in nodes_dict.values():
+        fid = file_map.get(n.file)
+        if fid:
+            links_json.append({"source": fid, "target": n.id, "ltype": "c"})
+    # Call links: symbol → symbol  (ltype "e")
     seen_links: set[tuple] = set()
     for n in nodes_dict.values():
         for callee_id in n.calls:
@@ -2174,232 +2235,519 @@ def generate_visual_graph(kg_path: str, out_path: str, max_nodes: int = 800) -> 
                 key = (n.id, callee_id)
                 if key not in seen_links:
                     seen_links.add(key)
-                    links_json.append({"source": n.id, "target": callee_id})
+                    links_json.append({"source": n.id, "target": callee_id, "ltype": "e"})
 
-    graph_data = json.dumps({"nodes": nodes_json, "links": links_json}, ensure_ascii=False)
-    node_count = len(nodes_json)
-    link_count = len(links_json)
+    file_count  = len(file_map)
+    sym_count   = len(nodes_dict)
+    graph_data  = json.dumps({"nodes": nodes_json, "links": links_json}, ensure_ascii=False)
+    node_count  = len(nodes_json)
+    link_count  = sum(1 for lk in links_json if lk["ltype"] == "e")   # display only call edges
+
+    # Simulation tuning
+    alpha_decay = 0.025
+    contain_dist = 70   if sym_count > 400 else 90     # file → symbol distance
+    call_dist    = 280  if sym_count > 400 else 380    # symbol → symbol call distance
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <title>repo2kg — {title}</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
-  *{{box-sizing:border-box;margin:0;padding:0}}
-  body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0d1117;color:#c9d1d9;overflow:hidden}}
-  #controls{{position:fixed;top:0;left:0;right:0;z-index:10;background:#161b22;border-bottom:1px solid #30363d;
-    padding:8px 16px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}}
-  #search{{background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#c9d1d9;
-    padding:4px 10px;font-size:13px;width:200px}}
-  #search:focus{{outline:none;border-color:#58a6ff}}
-  .fbtn{{background:none;border:1px solid #30363d;border-radius:4px;color:#8b949e;
-    padding:3px 10px;cursor:pointer;font-size:12px;transition:all .15s}}
-  .fbtn.on{{border-color:#58a6ff;color:#c9d1d9;background:#21262d}}
-  #legend{{display:flex;gap:10px;align-items:center;margin-left:auto;font-size:12px}}
-  .dot{{width:10px;height:10px;border-radius:50%;display:inline-block;margin-right:3px}}
-  #info{{font-size:11px;color:#6e7681}}
-  #tip{{position:fixed;background:#1c2128;border:1px solid #373e47;border-radius:8px;
-    padding:10px 14px;font-size:12px;max-width:320px;pointer-events:none;opacity:0;
-    transition:opacity .15s;z-index:100;line-height:1.5}}
-  #tip h4{{margin:0 0 4px;color:#58a6ff;font-size:13px}}
-  #tip .m{{color:#8b949e;margin:2px 0}}
-  #tip .sig{{font-family:monospace;font-size:11px;color:#d2a8ff;margin:4px 0;
-    white-space:pre-wrap;word-break:break-all;max-height:80px;overflow:hidden}}
-  svg{{width:100vw;height:100vh;cursor:grab}}
-  svg.dragging{{cursor:grabbing}}
-  .link{{stroke:#30363d;stroke-opacity:.7;fill:none;marker-end:url(#arr)}}
-  .link.hl{{stroke:#f78166;stroke-opacity:1;stroke-width:2}}
-  .node circle{{stroke-width:1.5;cursor:pointer}}
-  .node text{{font-size:9px;fill:#6e7681;pointer-events:none;dominant-baseline:middle}}
-  .node.sel circle{{stroke:#f0e68c!important;stroke-width:3}}
-  .node.dim{{opacity:.12}}
+* {{ box-sizing: border-box; margin: 0; padding: 0; }}
+body {{ font-family: 'Inter', -apple-system, sans-serif; background: #080c15; color: #f1f5f9; overflow: hidden; }}
+
+/* ── TOPBAR ── */
+#topbar {{ position: fixed; top: 0; left: 0; right: 0; height: 52px; z-index: 30;
+  background: rgba(8,12,21,0.85); backdrop-filter: blur(12px);
+  border-bottom: 1px solid rgba(255,255,255,0.07);
+  display: flex; align-items: center; gap: 14px; padding: 0 22px; }}
+#logo {{ font-size: 14px; font-weight: 600; color: #f8fafc; display: flex; align-items: center; gap: 7px; flex-shrink: 0; }}
+#logo svg {{ width: 16px; height: 16px; color: #6366f1; }}
+#search-wrap {{ position: relative; flex: 1; max-width: 300px; margin-left: 10px; }}
+#search-wrap svg {{ position: absolute; left: 10px; top: 50%; transform: translateY(-50%); width: 13px; height: 13px; color: #64748b; pointer-events: none; }}
+#search {{ width: 100%; background: #111827; border: 1px solid rgba(255,255,255,0.07); border-radius: 6px;
+  color: #f1f5f9; padding: 5px 12px 5px 30px; font-size: 12px; font-family: 'Inter'; outline: none; transition: all 0.2s; }}
+#search:focus {{ border-color: #6366f1; box-shadow: 0 0 0 2px rgba(99,102,241,0.15); }}
+#search::placeholder {{ color: #4b5563; }}
+
+.kbtn {{ display: flex; align-items: center; gap: 5px; background: transparent;
+  border: 1px solid rgba(255,255,255,0.08); border-radius: 5px;
+  color: #64748b; padding: 4px 10px; cursor: pointer; font-size: 11.5px; font-weight: 500;
+  transition: all 0.15s; flex-shrink: 0; }}
+.kbtn .dot {{ width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }}
+.kbtn[data-k="class"] .dot {{ background: #60a5fa; }}
+.kbtn[data-k="function"] .dot {{ background: #34d399; }}
+.kbtn[data-k="method"] .dot {{ background: #fb923c; }}
+.kbtn.on {{ background: rgba(255,255,255,0.07); border-color: rgba(255,255,255,0.15); color: #e2e8f0; }}
+#stats {{ margin-left: auto; font-size: 11px; color: #374151; flex-shrink: 0; }}
+#fit-btn {{ background: transparent; border: 1px solid rgba(255,255,255,0.08); border-radius: 5px;
+  color: #64748b; padding: 4px 10px; cursor: pointer; font-size: 11.5px; font-weight: 500;
+  transition: all 0.15s; display: flex; align-items: center; gap: 5px; flex-shrink: 0; }}
+#fit-btn:hover {{ background: rgba(255,255,255,0.06); color: #e2e8f0; }}
+#fit-btn svg {{ width: 13px; height: 13px; }}
+
+/* ── PANEL ── */
+#panel {{ position: fixed; right: 0; top: 52px; bottom: 0; width: 320px; z-index: 20;
+  background: #0a0e1a; border-left: 1px solid rgba(255,255,255,0.07);
+  box-shadow: -8px 0 24px rgba(0,0,0,0.4); overflow-y: auto;
+  transform: translateX(100%); transition: transform 0.28s cubic-bezier(0.16,1,0.3,1); }}
+#panel.open {{ transform: translateX(0); }}
+#panel-hdr {{ position: sticky; top: 0; background: #0a0e1a; border-bottom: 1px solid rgba(255,255,255,0.07);
+  padding: 18px 20px 14px; z-index: 2; display: flex; justify-content: space-between; align-items: flex-start; }}
+#close-panel {{ background: none; border: none; color: #4b5563; cursor: pointer; padding: 3px; border-radius: 4px; transition: all 0.15s; }}
+#close-panel:hover {{ background: rgba(255,255,255,0.08); color: #e2e8f0; }}
+#close-panel svg {{ width: 16px; height: 16px; }}
+#panel-body {{ padding: 0 20px 40px; }}
+.p-name {{ font-size: 15px; font-weight: 600; color: #f8fafc; margin-bottom: 6px; line-height: 1.3; word-break: break-word; padding-right: 20px; }}
+.badge {{ display: inline-flex; align-items: center; border-radius: 3px; padding: 2px 7px; font-size: 10px; font-weight: 700; margin-bottom: 14px; text-transform: uppercase; letter-spacing: 0.6px; }}
+.badge.class {{ background: rgba(96,165,250,0.1); color: #93c5fd; border: 1px solid rgba(96,165,250,0.2); }}
+.badge.function {{ background: rgba(52,211,153,0.1); color: #6ee7b7; border: 1px solid rgba(52,211,153,0.2); }}
+.badge.method {{ background: rgba(251,146,60,0.1); color: #fdba74; border: 1px solid rgba(251,146,60,0.2); }}
+.badge.file {{ background: rgba(99,102,241,0.1); color: #a5b4fc; border: 1px solid rgba(99,102,241,0.25); }}
+.psec {{ margin-top: 18px; }}
+.psec-title {{ font-size: 10px; font-weight: 600; color: #4b5563; text-transform: uppercase; letter-spacing: 0.6px; margin-bottom: 6px; display: flex; align-items: center; gap: 5px; }}
+.psec-title svg {{ width: 11px; height: 11px; }}
+.code-block {{ font-family: 'SFMono-Regular', Consolas, monospace; font-size: 11px; color: #c4b5fd;
+  background: #111827; border: 1px solid rgba(99,102,241,0.12); border-radius: 5px; padding: 10px; white-space: pre-wrap; word-break: break-all; line-height: 1.5; }}
+.path-block {{ font-family: monospace; font-size: 11px; color: #6b7280; word-break: break-all; line-height: 1.5; }}
+.doc-block {{ font-size: 12px; color: #9ca3af; line-height: 1.6; }}
+.sym-list {{ list-style: none; display: flex; flex-direction: column; gap: 4px; }}
+.sym-list li {{ font-size: 11px; color: #94a3b8; padding: 6px 10px; border-radius: 5px;
+  background: #111827; border: 1px solid rgba(255,255,255,0.04); font-family: monospace;
+  cursor: pointer; transition: all 0.15s; display: flex; align-items: center; gap: 7px; word-break: break-all; }}
+.sym-list li:hover {{ border-color: rgba(99,102,241,0.35); background: #1c2640; color: #f1f5f9; }}
+.sym-list li svg {{ width: 12px; height: 12px; flex-shrink: 0; opacity: 0.7; }}
+.sym-list li.ck svg {{ color: #60a5fa; }}
+.sym-list li.fk svg {{ color: #34d399; }}
+.sym-list li.mk svg {{ color: #fb923c; }}
+
+/* ── SVG ── */
+#kg-svg {{ position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; cursor: grab; }}
+#kg-svg.dragging {{ cursor: grabbing; }}
+
+/* Grid background */
+.bg-grid {{ fill: url(#gridPat); }}
+.bg-dots {{ fill: url(#dotPat); }}
+
+/* Links */
+.link-c {{ fill: none; stroke: rgba(99,102,241,0.08); stroke-width: 1; stroke-dasharray: 3,5; }}
+.link-e {{ fill: none; stroke: rgba(148,163,184,0.14); stroke-width: 1.4; }}
+.link.hl {{ stroke: rgba(99,102,241,0.65) !important; stroke-width: 1.8 !important; stroke-dasharray: none !important; }}
+.link.dim {{ opacity: 0.04 !important; }}
+
+/* File hub nodes */
+.file-aura {{ pointer-events: none; }}
+.file-circle {{ transition: all 0.2s; }}
+.node-g[data-kind="file"]:hover .file-circle {{ filter: brightness(1.3); }}
+.node-g.sel[data-kind="file"] .file-circle {{ stroke: #818cf8 !important; stroke-width: 2.5px; filter: drop-shadow(0 0 12px rgba(99,102,241,0.6)); }}
+.file-label {{ font-size: 10.5px; fill: #94a3b8; font-family: 'Inter'; font-weight: 500; text-anchor: middle; pointer-events: none; transition: fill 0.15s; }}
+.node-g[data-kind="file"]:hover .file-label, .node-g.sel[data-kind="file"] .file-label {{ fill: #f8fafc; }}
+.file-count {{ font-size: 11px; fill: #a5b4fc; font-family: 'Inter'; font-weight: 600; text-anchor: middle; dominant-baseline: central; pointer-events: none; }}
+.node-g[data-kind="file"].match .file-circle {{ stroke: #fde047 !important; stroke-width: 2px !important; }}
+
+/* Symbol nodes (pill) */
+.node-g {{ cursor: pointer; }}
+.node-g.dim {{ opacity: 0.12; }}
+.node-rect {{ fill: #111827; stroke-width: 1px; transition: fill 0.15s, filter 0.15s; }}
+.node-g[data-kind="class"]    .node-rect {{ stroke: rgba(96,165,250,0.4); }}
+.node-g[data-kind="function"] .node-rect {{ stroke: rgba(52,211,153,0.4); }}
+.node-g[data-kind="method"]   .node-rect {{ stroke: rgba(251,146,60,0.4); }}
+.node-g:hover                 .node-rect {{ fill: #1c2640; }}
+.node-g.sel                   .node-rect {{ fill: #1e293b; stroke-width: 2px; }}
+.node-g.sel[data-kind="class"]    .node-rect {{ stroke: #60a5fa; filter: drop-shadow(0 0 5px rgba(96,165,250,0.4)); }}
+.node-g.sel[data-kind="function"] .node-rect {{ stroke: #34d399; filter: drop-shadow(0 0 5px rgba(52,211,153,0.4)); }}
+.node-g.sel[data-kind="method"]   .node-rect {{ stroke: #fb923c; filter: drop-shadow(0 0 5px rgba(251,146,60,0.4)); }}
+.node-g.match .node-rect {{ stroke: #fde047 !important; stroke-width: 2px !important; }}
+
+.node-icon-bg {{ opacity: 0.12; }}
+.node-g[data-kind="class"]    .node-icon-bg {{ fill: #60a5fa; }}
+.node-g[data-kind="function"] .node-icon-bg {{ fill: #34d399; }}
+.node-g[data-kind="method"]   .node-icon-bg {{ fill: #fb923c; }}
+
+.node-icon {{ font-size: 9.5px; font-weight: 700; font-family: 'Inter'; text-anchor: middle; dominant-baseline: central; pointer-events: none; }}
+.node-g[data-kind="class"]    .node-icon {{ fill: #93c5fd; }}
+.node-g[data-kind="function"] .node-icon {{ fill: #6ee7b7; }}
+.node-g[data-kind="method"]   .node-icon {{ fill: #fdba74; }}
+
+.node-text {{ fill: #94a3b8; font-size: 10.5px; font-family: 'Inter'; font-weight: 500; dominant-baseline: central; pointer-events: none; }}
+.node-g:hover .node-text, .node-g.sel .node-text {{ fill: #f1f5f9; }}
 </style>
 </head>
 <body>
-<div id="controls">
-  <input id="search" type="text" placeholder="Search nodes…" autocomplete="off">
-  <button class="fbtn on" data-k="class">Classes</button>
-  <button class="fbtn on" data-k="function">Functions</button>
-  <button class="fbtn on" data-k="method">Methods</button>
-  <div id="legend">
-    <span><span class="dot" style="background:#79c0ff"></span>Class</span>
-    <span><span class="dot" style="background:#7ee787"></span>Function</span>
-    <span><span class="dot" style="background:#ffa657"></span>Method</span>
-  </div>
-  <span id="info">{node_count} nodes · {link_count} edges</span>
-</div>
-<div id="tip"></div>
-<svg>
+
+<svg style="display:none">
   <defs>
-    <marker id="arr" viewBox="0 -3 6 6" refX="15" refY="0"
-            markerWidth="4" markerHeight="4" orient="auto">
-      <path d="M0,-3L6,0L0,3" fill="#484f58"/>
+    <symbol id="i-repo"   viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 22v-4a4.8 4.8 0 0 0-1-3.5c3 0 6-2 6-5.5.08-1.25-.27-2.48-1-3.5.28-1.15.28-2.35 0-3.5 0 0-1 0-3 1.5-2.64-.5-5.36-.5-8 0C6 2 5 2 5 2c-.3 1.15-.3 2.35 0 3.5A5.403 5.403 0 0 0 4 9c0 3.5 3 5.5 6 5.5-.39.49-.68 1.05-.85 1.65-.17.6-.22 1.23-.15 1.85v4"/><path d="M9 18c-4.51 2-5-2-7-2"/></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+    <symbol id="i-fit"    viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/></symbol>
+    <symbol id="i-x"      viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></symbol>
+    <symbol id="i-file"   viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/></symbol>
+    <symbol id="i-code"   viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></symbol>
+    <symbol id="i-doc"    viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="21" y1="6" x2="3" y2="6"/><line x1="15" y1="12" x2="3" y2="12"/><line x1="17" y1="18" x2="3" y2="18"/></symbol>
+    <symbol id="i-out"    viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></symbol>
+    <symbol id="i-in"     viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></symbol>
+  </defs>
+</svg>
+
+<div id="topbar">
+  <div id="logo"><svg><use href="#i-repo"/></svg>repo2kg</div>
+  <div id="search-wrap">
+    <svg><use href="#i-search"/></svg>
+    <input id="search" type="text" placeholder="Search..." autocomplete="off" spellcheck="false">
+  </div>
+  <button class="kbtn on" data-k="class"><span class="dot"></span>Classes</button>
+  <button class="kbtn on" data-k="function"><span class="dot"></span>Functions</button>
+  <button class="kbtn on" data-k="method"><span class="dot"></span>Methods</button>
+  <span id="stats">{file_count} files · {sym_count} symbols · {link_count} calls</span>
+  <button id="fit-btn"><svg><use href="#i-fit"/></svg>Fit</button>
+</div>
+
+<div id="panel">
+  <div id="panel-hdr">
+    <div>
+      <div id="p-name" class="p-name"></div>
+      <span id="p-badge" class="badge"></span>
+    </div>
+    <button id="close-panel"><svg><use href="#i-x"/></svg></button>
+  </div>
+  <div id="panel-body"></div>
+</div>
+
+<svg id="kg-svg">
+  <defs>
+    <pattern id="gridPat" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M40 0L0 0 0 40" fill="none" stroke="rgba(255,255,255,0.025)" stroke-width="1"/>
+    </pattern>
+    <pattern id="dotPat" width="20" height="20" patternUnits="userSpaceOnUse">
+      <circle cx="10" cy="10" r="1.2" fill="rgba(255,255,255,0.04)"/>
+    </pattern>
+    <radialGradient id="file-grad" cx="40%" cy="35%" r="65%">
+      <stop offset="0%"   stop-color="#1e1b4b"/>
+      <stop offset="100%" stop-color="#080c15"/>
+    </radialGradient>
+    <marker id="arr" viewBox="0 -4 8 8" refX="22" refY="0" markerWidth="5" markerHeight="5" orient="auto">
+      <path d="M0,-3L6,0L0,3" fill="rgba(148,163,184,0.3)"/>
+    </marker>
+    <marker id="arr-hl" viewBox="0 -4 8 8" refX="22" refY="0" markerWidth="5" markerHeight="5" orient="auto">
+      <path d="M0,-3L6,0L0,3" fill="rgba(99,102,241,0.8)"/>
     </marker>
   </defs>
+  <rect width="100%" height="100%" class="bg-grid"/>
+  <rect width="100%" height="100%" class="bg-dots"/>
   <g id="zg">
     <g id="lg"></g>
     <g id="ng"></g>
   </g>
 </svg>
-<script src="https://d3js.org/d3.v7.min.js"></script>
+
+{_get_d3_script()}
 <script>
 const DATA = {graph_data};
-const KC = {{class:"#79c0ff",function:"#7ee787",method:"#ffa657"}};
-const KR = {{class:9,function:6,method:5}};
+const CONTAIN_DIST = {contain_dist};
+const CALL_DIST    = {call_dist};
+const ALPHA_DECAY  = {alpha_decay};
+
+const NODE_H = 26, ICON_R = 13, PAD_R = 10;
+
 let active = new Set(["class","function","method"]);
-let sel = null;
+let sel = null, searchQ = "";
 
-const svg = d3.select("svg");
-const g   = svg.select("#zg");
-const tip = document.getElementById("tip");
+const W = window.innerWidth, H = window.innerHeight;
+const svg   = d3.select("#kg-svg");
+const gRoot = svg.select("#zg");
 
-const zoom = d3.zoom().scaleExtent([0.03,8]).on("zoom", e => {{
-  g.attr("transform", e.transform);
+/* ── Zoom ── */
+const zoom = d3.zoom().scaleExtent([0.05, 8]).on("zoom", e => {{
+  gRoot.attr("transform", e.transform);
   svg.classed("dragging", e.sourceEvent && e.sourceEvent.buttons === 1);
 }});
 svg.call(zoom).on("dblclick.zoom", null);
+svg.on("click", e => {{
+  if (e.target === svg.node() || e.target.tagName === "rect" || e.target.tagName === "circle")
+    {{ sel = null; closePanel(); paint(); }}
+}});
 
-const W = window.innerWidth, H = window.innerHeight;
-const sim = d3.forceSimulation()
-  .force("link",  d3.forceLink().id(d=>d.id).distance(60).strength(0.5))
-  .force("charge",d3.forceManyBody().strength(-150))
-  .force("center",d3.forceCenter(W/2, H/2))
-  .force("x",     d3.forceX(W/2).strength(0.03))
-  .force("y",     d3.forceY(H/2).strength(0.03))
-  .force("coll",  d3.forceCollide(14));
-
-let linkSel, nodeSel;
-
-function visible() {{
-  const q = document.getElementById("search").value.toLowerCase().trim();
-  return DATA.nodes.filter(n => {{
-    if (!active.has(n.kind)) return false;
-    if (q && !n.name.toLowerCase().includes(q) && !n.file.toLowerCase().includes(q)) return false;
-    return true;
-  }});
+/* ── File node radius (scales with symbol count) ── */
+function fileR(d) {{
+  return Math.max(24, Math.min(48, 18 + (d.sym_count || 1) * 1.2));
 }}
 
+/* ── Symbol pill width ── */
+function pillW(name) {{
+  const n = Math.min(name.length, 28);
+  return ICON_R * 2 + n * 6.2 + PAD_R;
+}}
+
+/* ── Simulation ── */
+const sim = d3.forceSimulation()
+  .alphaDecay(ALPHA_DECAY)
+  .velocityDecay(0.45)
+  .force("link", d3.forceLink().id(d => d.id)
+    .distance(d => d.ltype === "c" ? CONTAIN_DIST : CALL_DIST)
+    .strength(d => d.ltype === "c" ? 0.9 : 0.07))
+  .force("charge", d3.forceManyBody()
+    .strength(d => d.kind === "file" ? -1800 : -60)
+    .distanceMax(1200))
+  .force("center", d3.forceCenter(W / 2, H / 2))
+  .force("coll", d3.forceCollide(d => d.kind === "file" ? fileR(d) + 18 : pillW(d.name) / 2 + 8))
+  .force("x", d3.forceX(W / 2).strength(0.018))
+  .force("y", d3.forceY(H / 2).strength(0.018));
+
+let linkSel = d3.select(null), nodeSel = d3.select(null);
+
+/* ── Visible nodes (file nodes always shown) ── */
+function visible() {{
+  return DATA.nodes.filter(n => n.kind === "file" || active.has(n.kind));
+}}
+
+/* ── Render ── */
 function render() {{
   const vis    = visible();
-  const visSet = new Set(vis.map(n=>n.id));
-  const visLinks = DATA.links.filter(l =>
-    visSet.has(typeof l.source==="object"?l.source.id:l.source) &&
-    visSet.has(typeof l.target==="object"?l.target.id:l.target));
+  const visSet = new Set(vis.map(n => n.id));
+  const visLinks = DATA.links.filter(l => {{
+    const s = typeof l.source === "object" ? l.source.id : l.source;
+    const t = typeof l.target === "object" ? l.target.id : l.target;
+    return visSet.has(s) && visSet.has(t);
+  }});
 
-  document.getElementById("info").textContent =
-    vis.length + " nodes · " + visLinks.length + " edges";
+  /* Links */
+  const lJoin = gRoot.select("#lg").selectAll("path.link")
+    .data(visLinks, d => `${{(d.source.id||d.source)}}→${{(d.target.id||d.target)}}`);
+  lJoin.enter().append("path")
+    .attr("class", d => `link link-${{d.ltype}}`)
+    .attr("marker-end", d => d.ltype === "e" ? "url(#arr)" : null);
+  lJoin.exit().remove();
+  linkSel = gRoot.select("#lg").selectAll("path.link");
 
-  // Links
-  linkSel = g.select("#lg").selectAll(".link")
-    .data(visLinks, d=>`${{d.source.id||d.source}}-${{d.target.id||d.target}}`);
-  linkSel.enter().append("line").attr("class","link").merge(linkSel);
-  linkSel.exit().remove();
-  linkSel = g.select("#lg").selectAll(".link");
-
-  // Nodes
-  const nd = g.select("#ng").selectAll(".node").data(vis, d=>d.id);
-  const ndE = nd.enter().append("g").attr("class","node")
+  /* Nodes */
+  const nJoin = gRoot.select("#ng").selectAll("g.node-g").data(vis, d => d.id);
+  const nEnter = nJoin.enter().append("g")
+    .attr("class", "node-g")
+    .attr("data-kind", d => d.kind)
     .call(d3.drag()
-      .on("start",(e,d)=>{{if(!e.active)sim.alphaTarget(0.3).restart();d.fx=d.x;d.fy=d.y}})
-      .on("drag", (e,d)=>{{d.fx=e.x;d.fy=e.y}})
-      .on("end",  (e,d)=>{{if(!e.active)sim.alphaTarget(0);d.fx=null;d.fy=null}}))
-    .on("click", (_,d)=>{{sel=sel===d.id?null:d.id;paint()}})
-    .on("mouseover",(e,d)=>showTip(e,d))
-    .on("mousemove",(e)=>moveTip(e))
-    .on("mouseout", ()=>{{tip.style.opacity=0}});
-  ndE.append("circle")
-    .attr("r",d=>KR[d.kind]||5)
-    .attr("fill",d=>KC[d.kind]||"#8b949e")
-    .attr("stroke",d=>d3.color(KC[d.kind]||"#8b949e").darker(0.6));
-  ndE.append("text").attr("dx",d=>(KR[d.kind]||5)+4).attr("dy","0.35em").text(d=>d.name);
-  nd.exit().remove();
-  nodeSel = g.select("#ng").selectAll(".node");
+      .on("start", (e, d) => {{ if (!e.active) sim.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; }})
+      .on("drag",  (e, d) => {{ d.fx = e.x; d.fy = e.y; }})
+      .on("end",   (e, d) => {{ if (!e.active) sim.alphaTarget(0); d.fx = null; d.fy = null; }}))
+    .on("click", (e, d) => {{
+      e.stopPropagation();
+      sel = sel === d.id ? null : d.id;
+      if (sel) openPanel(d); else closePanel();
+      paint();
+    }});
 
-  sim.nodes(vis).on("tick", ()=>{{
-    linkSel
-      .attr("x1",d=>d.source.x).attr("y1",d=>d.source.y)
-      .attr("x2",d=>d.target.x).attr("y2",d=>d.target.y);
-    nodeSel.attr("transform",d=>`translate(${{d.x}},${{d.y}})`);
+  /* Build per-node shapes */
+  nEnter.each(function(d) {{
+    const g = d3.select(this);
+    if (d.kind === "file") {{
+      const r = fileR(d);
+      /* Aura ring */
+      g.append("circle").attr("class", "file-aura")
+        .attr("r", r + 14)
+        .attr("fill", "rgba(99,102,241,0.03)")
+        .attr("stroke", "rgba(99,102,241,0.1)")
+        .attr("stroke-width", 1);
+      /* Main circle */
+      g.append("circle").attr("class", "file-circle")
+        .attr("r", r)
+        .attr("fill", "url(#file-grad)")
+        .attr("stroke", "#4338ca")
+        .attr("stroke-width", 1.5);
+      /* Symbol count */
+      g.append("text").attr("class", "file-count")
+        .attr("y", 0)
+        .text(d.sym_count || "");
+      /* Filename label below */
+      g.append("text").attr("class", "file-label")
+        .attr("y", r + 13)
+        .text(d.name.length > 24 ? d.name.slice(0, 22) + "…" : d.name);
+    }} else {{
+      const w = pillW(d.name);
+      g.append("rect").attr("class", "node-rect")
+        .attr("rx", NODE_H / 2).attr("ry", NODE_H / 2)
+        .attr("height", NODE_H).attr("y", -NODE_H / 2)
+        .attr("width", w).attr("x", -ICON_R);
+      g.append("circle").attr("class", "node-icon-bg").attr("r", ICON_R);
+      g.append("text").attr("class", "node-icon").text(d.kind[0].toUpperCase());
+      g.append("text").attr("class", "node-text")
+        .attr("x", ICON_R + 5)
+        .text(d.name.length > 28 ? d.name.slice(0, 26) + "…" : d.name);
+    }}
+  }});
+
+  nJoin.exit().remove();
+  nodeSel = gRoot.select("#ng").selectAll("g.node-g");
+
+  sim.nodes(vis).on("tick", () => {{
+    linkSel.attr("d", d => {{
+      const sx = d.source.x, sy = d.source.y, tx = d.target.x, ty = d.target.y;
+      const mx = (sx + tx) / 2, my = (sy + ty) / 2;
+      return `M${{sx}},${{sy}} Q${{mx}},${{my}} ${{tx}},${{ty}}`;
+    }});
+    nodeSel.attr("transform", d => `translate(${{d.x}},${{d.y}})`);
   }});
   sim.force("link").links(visLinks);
-  sim.alpha(0.5).restart();
+  sim.alpha(0.7).restart();
   paint();
 }}
 
+/* ── Connected IDs ── */
 function connectedIds(id) {{
   const ids = new Set([id]);
-  (linkSel||d3.selectAll(".link")).each(d=>{{
-    const s=d.source.id||d.source, t=d.target.id||d.target;
-    if(s===id) ids.add(t);
-    if(t===id) ids.add(s);
+  linkSel.each(d => {{
+    const s = d.source.id || d.source, t = d.target.id || d.target;
+    if (s === id) ids.add(t);
+    if (t === id) ids.add(s);
   }});
   return ids;
 }}
 
+/* ── Paint ── */
 function paint() {{
-  if (!nodeSel) return;
-  if (!sel) {{
-    nodeSel.classed("sel",false).classed("dim",false);
-    if(linkSel) linkSel.classed("hl",false);
+  const q = searchQ.toLowerCase().trim();
+
+  if (!sel && !q) {{
+    nodeSel.classed("sel", false).classed("dim", false).classed("match", false);
+    linkSel.classed("hl", false).classed("dim", false).attr("marker-end", d => d.ltype === "e" ? "url(#arr)" : null);
     return;
   }}
+
+  if (q && !sel) {{
+    const hits = new Set(DATA.nodes.filter(n =>
+      n.name.toLowerCase().includes(q) || n.file.toLowerCase().includes(q)).map(n => n.id));
+    // Also highlight file nodes that contain a hit symbol
+    DATA.nodes.filter(n => n.kind === "file").forEach(fn => {{
+      if (DATA.nodes.some(sn => sn.kind !== "file" && sn.file === fn.file && hits.has(sn.id)))
+        hits.add(fn.id);
+    }});
+    nodeSel.classed("match", d => hits.has(d.id))
+           .classed("dim",   d => d.kind !== "file" && !hits.has(d.id))
+           .classed("sel", false);
+    linkSel.classed("hl", false).classed("dim", true).attr("marker-end", d => d.ltype === "e" ? "url(#arr)" : null);
+    return;
+  }}
+
   const nb = connectedIds(sel);
-  nodeSel.classed("sel",d=>d.id===sel).classed("dim",d=>!nb.has(d.id));
-  if(linkSel) linkSel.classed("hl",d=>{{
-    const s=d.source.id||d.source,t=d.target.id||d.target;
-    return (s===sel||t===sel);
-  }});
+  nodeSel.classed("sel",   d => d.id === sel)
+         .classed("dim",   d => d.kind !== "file" && !nb.has(d.id))
+         .classed("match", false);
+  linkSel.classed("hl",  d => {{ const s = d.source.id||d.source, t = d.target.id||d.target; return s === sel || t === sel; }})
+         .classed("dim", d => {{ const s = d.source.id||d.source, t = d.target.id||d.target; return !(s === sel || t === sel); }})
+         .attr("marker-end", d => {{
+           const s = d.source.id||d.source, t = d.target.id||d.target;
+           return (s === sel || t === sel) ? "url(#arr-hl)" : (d.ltype === "e" ? "url(#arr)" : null);
+         }});
 }}
 
-function showTip(e, d) {{
-  const calls   = (d.calls||[]).slice(0,6).join(", ");
-  const callers = (d.callers||[]).slice(0,6).join(", ");
-  tip.innerHTML = `
-    <h4>${{d.name}}</h4>
-    <div class="m"><b>${{d.kind}}</b> · ${{d.file}}</div>
-    ${{d.docstring?`<div class="m">${{d.docstring.slice(0,200)}}</div>`:""}}
-    <div class="sig">${{(d.signature||"").slice(0,130)}}</div>
-    ${{calls?`<div class="m">→ calls: ${{calls}}</div>`:""}}
-    ${{callers?`<div class="m">← by: ${{callers}}</div>`:""}}
-  `;
-  tip.style.opacity = 1;
-  moveTip(e);
-}}
-function moveTip(e) {{
-  const x = Math.min(e.clientX+18, window.innerWidth-340);
-  const y = Math.min(e.clientY+12, window.innerHeight-200);
-  tip.style.left = x+"px"; tip.style.top = y+"px";
+/* ── Panel ── */
+function esc(s) {{ const d = document.createElement("div"); d.textContent = String(s||""); return d.innerHTML; }}
+
+function openPanel(d) {{
+  document.getElementById("p-name").textContent = d.name;
+  const badge = document.getElementById("p-badge");
+  badge.className = "badge " + d.kind;
+  badge.textContent = d.kind;
+
+  let html = "";
+
+  if (d.kind === "file") {{
+    const symbols = DATA.nodes.filter(n => n.file === d.file && n.kind !== "file");
+    const classes  = symbols.filter(n => n.kind === "class");
+    const funcs    = symbols.filter(n => n.kind === "function");
+    const methods  = symbols.filter(n => n.kind === "method");
+
+    html += `<div class="psec"><div class="psec-title"><svg><use href="#i-file"/></svg>File</div>
+      <div class="path-block">${{esc(d.file)}}</div></div>`;
+
+    for (const [label, items, cls, icon] of [
+      ["Classes",   classes, "ck", "i-code"],
+      ["Functions", funcs,   "fk", "i-code"],
+      ["Methods",   methods, "mk", "i-code"],
+    ]) {{
+      if (!items.length) continue;
+      html += `<div class="psec"><div class="psec-title"><svg><use href="#${{icon}}"/></svg>${{label}} (${{items.length}})</div>
+        <ul class="sym-list">${{items.slice(0, 25).map(n =>
+          `<li class="${{cls}}" onclick="clickSym('${{esc(n.id)}}')"><svg><use href="#i-code"/></svg>${{esc(n.name)}}</li>`
+        ).join("")}}${{items.length > 25 ? `<li style="color:#4b5563;cursor:default">... ${{items.length-25}} more</li>` : ""}}</ul></div>`;
+    }}
+  }} else {{
+    html += `<div class="psec"><div class="psec-title"><svg><use href="#i-file"/></svg>File</div>
+      <div class="path-block">${{esc(d.file)}}</div></div>`;
+
+    if (d.signature) html += `<div class="psec"><div class="psec-title"><svg><use href="#i-code"/></svg>Signature</div>
+      <div class="code-block">${{esc((d.signature||"").slice(0, 250))}}</div></div>`;
+
+    if (d.docstring) html += `<div class="psec"><div class="psec-title"><svg><use href="#i-doc"/></svg>Description</div>
+      <div class="doc-block">${{esc((d.docstring||"").slice(0, 400))}}</div></div>`;
+
+    const calls   = (d.calls||[]).slice(0, 12);
+    const callers = (d.callers||[]).slice(0, 12);
+
+    if (calls.length) html += `<div class="psec"><div class="psec-title"><svg><use href="#i-out"/></svg>Calls (${{d.calls.length}})</div>
+      <ul class="sym-list">${{calls.map(c => `<li class="fk" onclick="selectByName('${{esc(c)}}')"><svg><use href="#i-out"/></svg>${{esc(c)}}</li>`).join("")}}</ul></div>`;
+
+    if (callers.length) html += `<div class="psec"><div class="psec-title"><svg><use href="#i-in"/></svg>Called by (${{d.callers.length}})</div>
+      <ul class="sym-list">${{callers.map(c => `<li class="mk" onclick="selectByName('${{esc(c)}}')"><svg><use href="#i-in"/></svg>${{esc(c)}}</li>`).join("")}}</ul></div>`;
+  }}
+
+  document.getElementById("panel-body").innerHTML = html;
+  document.getElementById("panel").classList.add("open");
 }}
 
-document.querySelectorAll(".fbtn").forEach(b=>b.addEventListener("click",()=>{{
-  const k=b.dataset.k;
-  if(active.has(k)){{active.delete(k);b.classList.remove("on")}}
-  else{{active.add(k);b.classList.add("on")}}
+function closePanel() {{ document.getElementById("panel").classList.remove("open"); }}
+
+window.clickSym = function(nodeId) {{
+  const node = DATA.nodes.find(n => n.id === nodeId);
+  if (!node) return;
+  if (!active.has(node.kind)) {{ active.add(node.kind); document.querySelector(`.kbtn[data-k="${{node.kind}}"]`)?.classList.add("on"); render(); }}
+  sel = node.id;
+  openPanel(node);
+  paint();
+  panTo(node);
+}};
+
+window.selectByName = function(name) {{
+  const node = DATA.nodes.find(n => n.name === name || n.id.endsWith("::" + name));
+  if (!node) return;
+  window.clickSym(node.id);
+}};
+
+function panTo(node) {{
+  const sc = d3.zoomTransform(svg.node()).k;
+  const pW = document.getElementById("panel").classList.contains("open") ? 320 : 0;
+  svg.transition().duration(400)
+     .call(zoom.transform, d3.zoomIdentity.translate((W - pW) / 2 - node.x * sc, H / 2 - node.y * sc).scale(sc));
+}}
+
+/* ── Controls ── */
+document.querySelectorAll(".kbtn").forEach(b => b.addEventListener("click", () => {{
+  const k = b.dataset.k;
+  active.has(k) ? (active.delete(k), b.classList.remove("on")) : (active.add(k), b.classList.add("on"));
   render();
 }}));
 
-let st;
-document.getElementById("search").addEventListener("input",()=>{{
-  clearTimeout(st); st=setTimeout(render,250);
+let _st;
+document.getElementById("search").addEventListener("input", e => {{
+  searchQ = e.target.value;
+  clearTimeout(_st); _st = setTimeout(paint, 140);
 }});
+document.getElementById("close-panel").addEventListener("click", () => {{ sel = null; closePanel(); paint(); }});
+document.getElementById("fit-btn").addEventListener("click", fitView);
 
-svg.on("click",(e)=>{{
-  if(e.target===svg.node()||e.target===g.node()){{sel=null;paint()}}
-}});
+function fitView() {{
+  const b = gRoot.node().getBBox();
+  if (!b.width) return;
+  const pW = document.getElementById("panel").classList.contains("open") ? 320 : 0;
+  const sc = Math.min(0.88, Math.min((W - pW - 40) / b.width, (H - 72) / b.height));
+  svg.transition().duration(600)
+     .call(zoom.transform, d3.zoomIdentity
+       .translate((W - pW - b.width * sc) / 2 - b.x * sc, (H - b.height * sc) / 2 - b.y * sc + 52)
+       .scale(sc));
+}}
 
 render();
-
-// Auto-fit on first render
-setTimeout(()=>{{
-  const bounds = g.node().getBBox();
-  if(bounds.width>0){{
-    const scale = Math.min(0.9, Math.min(W/bounds.width, (H-48)/bounds.height));
-    const tx = (W - bounds.width*scale)/2 - bounds.x*scale;
-    const ty = (H - bounds.height*scale)/2 - bounds.y*scale + 24;
-    svg.call(zoom.transform, d3.zoomIdentity.translate(tx,ty).scale(scale));
-  }}
-}}, 2500);
+setTimeout(fitView, 2800);
 </script>
 </body>
 </html>"""
@@ -2599,7 +2947,7 @@ def _load_registry() -> dict:
 
 def _save_registry(reg: dict):
     REPO2KG_HOME.mkdir(parents=True, exist_ok=True)
-    with open(REGISTRY_PATH, "w") as f:
+    with open(REGISTRY_PATH, "w", encoding="utf-8") as f:
         json.dump(reg, f, indent=2)
 
 
@@ -2616,7 +2964,7 @@ def _load_config() -> dict:
 
 def _save_config(config: dict):
     REPO2KG_HOME.mkdir(parents=True, exist_ok=True)
-    with open(CONFIG_PATH, "w") as f:
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2)
 
 
@@ -2631,7 +2979,7 @@ def _merge_file_with_block(file_path: Path, new_block: str) -> None:
     If markers already exist the section between them is replaced.
     Otherwise the block is appended, preserving all existing content.
     """
-    existing = file_path.read_text() if file_path.exists() else ""
+    existing = file_path.read_text(encoding="utf-8") if file_path.exists() else ""
     if _REPO2KG_MARKER in existing:
         new_content = _re.sub(
             rf"{_re.escape(_REPO2KG_MARKER)}.*?{_re.escape(_REPO2KG_END_MARKER)}",
@@ -2641,7 +2989,7 @@ def _merge_file_with_block(file_path: Path, new_block: str) -> None:
         )
     else:
         new_content = existing.rstrip() + ("\n\n" if existing else "") + new_block
-    file_path.write_text(new_content)
+    file_path.write_text(new_content, encoding="utf-8")
 
 
 def _delete_cached_model(model_name: str) -> None:
@@ -2821,18 +3169,15 @@ if registry_path.exists():
         # Now search: replace KEYWORD with what you need
         matches = [n for n in kg.values() if "KEYWORD" in n["name"].lower()]
         for n in matches[:10]:
-            print(n["signature"], "—", n.get("docstring","")[:100])
+            print(n["signature"], "--", n.get("docstring","")[:100])
 '''
 
     # ── ~/.claude/CLAUDE.md ─────────────────────────────────────────
     claude_dir = Path.home() / ".claude"
     claude_dir.mkdir(parents=True, exist_ok=True)
-    claude_global = Path(claude_dir / "CLAUDE.md")
+    claude_global = claude_dir / "CLAUDE.md"
 
-    existing_content = claude_global.read_text() if claude_global.exists() else ""
-    marker = "<!-- repo2kg-start -->"
-    end_marker = "<!-- repo2kg-end -->"
-    repo2kg_block = f"""{marker}
+    repo2kg_block = f"""{_REPO2KG_MARKER}
 ## repo2kg — Code Knowledge Graph
 
 A global project registry is at `{registry_path_str}`.
@@ -2855,31 +3200,18 @@ key: "relative/file.py::ClassName.method"
 fields: id, name, kind, file, parent_class, signature,
         docstring, body_preview (8 lines), calls[], callers[], imports[]
 ```
-{end_marker}
+{_REPO2KG_END_MARKER}
 """
 
-    if marker in existing_content:
-        # Replace existing block
-        import re
-        new_content = re.sub(
-            rf"{re.escape(marker)}.*?{re.escape(end_marker)}",
-            repo2kg_block.strip(),
-            existing_content,
-            flags=re.DOTALL,
-        )
-    else:
-        new_content = existing_content.rstrip() + ("\n\n" if existing_content else "") + repo2kg_block
-
-    claude_global.write_text(new_content)
+    _merge_file_with_block(claude_global, repo2kg_block)
     print(f"Updated {claude_global}")
 
     # ── ~/.codex/AGENTS.md ──────────────────────────────────────────
     codex_dir = Path.home() / ".codex"
     codex_dir.mkdir(parents=True, exist_ok=True)
     codex_agents = codex_dir / "AGENTS.md"
-    existing_codex = codex_agents.read_text() if codex_agents.exists() else ""
-    codex_block = f"""{marker}
-# repo2kg — Code Knowledge Graph
+    codex_block = f"""{_REPO2KG_MARKER}
+# repo2kg -- Code Knowledge Graph
 
 Registry: `{registry_path_str}`
 
@@ -2890,19 +3222,9 @@ For any task on a Python project, start with:
 
 Then query the returned `kg` dict instead of reading source files.
 Node fields: `name`, `kind`, `file`, `signature`, `docstring`, `body_preview`, `calls`, `callers`.
-{end_marker}
+{_REPO2KG_END_MARKER}
 """
-    if marker in existing_codex:
-        import re
-        new_codex = re.sub(
-            rf"{re.escape(marker)}.*?{re.escape(end_marker)}",
-            codex_block.strip(),
-            existing_codex,
-            flags=re.DOTALL,
-        )
-    else:
-        new_codex = existing_codex.rstrip() + ("\n\n" if existing_codex else "") + codex_block
-    codex_agents.write_text(new_codex)
+    _merge_file_with_block(codex_agents, codex_block)
     print(f"Updated {codex_agents}")
 
     # ── ~/.repo2kg/GLOBAL_AGENTS.md ─────────────────────────────────
@@ -2912,7 +3234,7 @@ Node fields: `name`, `kind`, `file`, `signature`, `docstring`, `body_preview`, `
 # repo2kg Global Agent Reference
 
 ## Registry
-`{registry_path_str}` — maps project paths to their KG files.
+`{registry_path_str}` -- maps project paths to their KG files.
 
 ## Commands
 ```bash

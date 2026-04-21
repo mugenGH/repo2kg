@@ -113,6 +113,9 @@ repo2kg agent-setup --kg kg.json --dir .
 
 # 4. Query it
 repo2kg query "how does authentication work" --kg kg.json
+
+# 5. Generate an interactive visual graph
+repo2kg visualize --kg kg.json --out kg_graph.html
 ```
 
 ---
@@ -370,6 +373,7 @@ repo2kg build        Build KG from a repository
 repo2kg query        Semantic search (requires FAISS)
 repo2kg query-lite   Keyword search (zero dependencies)
 repo2kg export       Export as CODEBASE.md
+repo2kg visualize    Generate interactive HTML graph (no browser server needed)
 repo2kg agent-setup  Generate all agent instruction files
 repo2kg user-setup   Install global agent instructions (run once)
 repo2kg scan         Auto-discover and register all KGs under a directory
@@ -384,6 +388,8 @@ repo2kg info         Print machine-readable tool info (for agents)
 | Flag | Default | Description |
 |---|---|---|
 | `--repo` | `.` | Repository root to scan |
+| `--out` (visualize) | `kg_graph.html` | Output HTML path for `visualize` |
+| `--max-nodes` | `800` | Max symbol nodes in the HTML graph |
 | `--out` | `kg.json` | Output path (`.json` or `.toon`) |
 | `--kg` | `kg.json` | Path to a saved KG file |
 | `--k` | `5` | Number of top results |
@@ -473,11 +479,57 @@ Every node in `kg.json` / `kg.toon`:
 
 ---
 
+## Interactive Graph Visualization
+
+Generate a fully self-contained HTML file — no server, no CDN, works offline:
+
+```bash
+repo2kg visualize --kg kg.json --out kg_graph.html
+# open kg_graph.html in any browser
+```
+
+### What you see
+
+The graph uses a **file-hub layout**:
+
+- **Large indigo circles** = your source files, sized by how many symbols they contain
+- **Small pill nodes** = functions, classes, and methods inside each file
+- **Dashed lines** = containment (file → its symbols)
+- **Solid arrows** = call edges between symbols
+
+### What's included
+
+Only **user-written code** is rendered. Third-party and bundled files are automatically excluded from the HTML graph (but remain in the KG file for queries):
+
+| Excluded path pattern | Example |
+|---|---|
+| `.vite/deps/` | Vite-bundled npm packages |
+| `node_modules/` | Raw npm packages |
+| `site-packages/` | Python pip packages |
+| `/dist/` | Build output |
+| `/.cache/` | Build caches |
+
+This typically reduces a 1500-node cluttered graph down to just your 100–300 meaningful nodes.
+
+### Interactions
+
+| Action | Result |
+|---|---|
+| Click a **file node** | Sidebar lists all its classes, functions, methods |
+| Click a **symbol node** | Sidebar shows signature, docstring, calls, callers |
+| Toggle **Classes / Functions / Methods** | Show/hide node kinds |
+| Search box | Highlights matching nodes across files |
+| **Fit** button | Auto-zooms to show the full graph |
+| Drag any node | Pin it in place |
+
+---
+
 ## Limitations
 
 - **Static analysis only** — captures defined calls, not dynamic dispatch or runtime-generated calls
 - **Name-based call resolution** — same-file preferred; no full type inference
 - **No incremental updates** — rebuilds the full graph each time (30–60s for large repos)
+- **Visualization shows user code only** — third-party files (`.vite/deps/`, `node_modules/`, `site-packages/`) are kept in the KG file but excluded from the HTML graph
 
 ---
 
