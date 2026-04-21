@@ -33,7 +33,7 @@ Format auto-detection:
   FAISS sidecar files (.faiss, .idx) use the base name regardless of format
 """
 
-__version__ = "0.5.14"
+__version__ = "0.5.15"
 
 import os
 import sys
@@ -2915,20 +2915,27 @@ and {edge_count} call edges across {len(files)} files.
 
 ## How to Use the Knowledge Graph
 
-### Option 1: Read the exported summary (fastest, zero deps)
+### Option 1: Compact project map — START HERE (~10k tokens)
 ```bash
-cat CODEBASE.md
+repo2kg summary --kg {kg_rel}
 ```
-This file contains the full architecture overview, file map, class/function index,
-call graph, and all signatures. It's usually enough to answer most questions.
+Prints a directory-grouped file map of all classes and top-level functions.
+Covers the whole codebase in ~10k tokens. Use this for orientation before
+making any changes. Save to file with `--out SUMMARY.md`.
 
-### Option 2: Lightweight keyword query (Python stdlib only)
+### Option 2: Targeted semantic search (~400 tokens/query)
+```bash
+repo2kg query "how does authentication work" --kg {kg_rel}
+repo2kg query-lite "auth" --kg {kg_rel}    # instant keyword search, no FAISS
+```
+Run 2-5 targeted queries to find the specific symbols relevant to your task.
+
+### Option 3: Lightweight keyword query (Python stdlib only, zero deps)
 ```bash
 python3 -c "
 import json
 data = json.load(open('{kg_rel}'))
-# Search by keyword
-matches = {{k: v for k, v in data.items() if 'YOUR_KEYWORD' in k.lower() or 'YOUR_KEYWORD' in v.get('docstring','').lower() or 'YOUR_KEYWORD' in v.get('name','').lower()}}
+matches = {{k: v for k, v in data.items() if 'YOUR_KEYWORD' in k.lower() or 'YOUR_KEYWORD' in v.get('name','').lower()}}
 for node_id, node in list(matches.items())[:10]:
     print(f\\"\\n## {{node['kind'].upper()}}: {{node['name']}}\\")
     print(f\\"File: {{node['file']}}\\")
@@ -2938,29 +2945,31 @@ for node_id, node in list(matches.items())[:10]:
 "
 ```
 
-### Option 3: repo2kg CLI (if installed)
-```bash
-repo2kg query "how does authentication work" --kg {kg_rel}
-repo2kg query-lite "auth" --kg {kg_rel}    # no FAISS needed
-```
-
 ### Option 4: Structured JSON output (for programmatic use)
 ```bash
 repo2kg query "auth" --kg {kg_rel} --format json
 ```
 
+## Recommended Workflow (minimal token cost)
+
+1. `repo2kg summary --kg {kg_rel}` — orientation map (~10k tokens)
+2. `repo2kg query "<topic>" --kg {kg_rel}` — drill into relevant area (~400 tokens/query)
+3. `read_file` only the specific file you need to edit
+
+**Total: ~11k tokens** vs ~60k for a full CODEBASE.md export — 83% savings.
+
 ## Rules
 
 1. **Before reading any source file**, check if the KG already has what you need
-2. Only read actual source files when you need the full implementation (>8 lines)
-3. The KG includes 8-line body previews — often sufficient for understanding logic
-4. Use call edges to trace dependencies instead of grepping across files
-5. The `CODEBASE.md` file is the fastest way to get a project overview
+2. Start every session with `repo2kg summary` — not `cat CODEBASE.md`
+3. Only read actual source files when you need the full implementation (>8 lines)
+4. The KG includes 8-line body previews — often sufficient for understanding logic
+5. Use call edges to trace dependencies instead of grepping across files
 
 ## Project Structure
 
-- `{kg_rel}` — Knowledge graph (JSON, {node_count} nodes)
-- `CODEBASE.md` — Agent-readable project overview (generated from KG)
+- `{kg_rel}` — Knowledge graph ({node_count} nodes)
+- Run `repo2kg summary --kg {kg_rel}` for the project overview
 """
 
     # ── .copilot-instructions.md ──────────────────────────────────────
@@ -2971,21 +2980,31 @@ repo2kg query "auth" --kg {kg_rel} --format json
 A pre-built knowledge graph is available at `{kg_rel}` with {node_count} code nodes
 ({len(files)} files, {edge_count} call edges).
 
-### Quick lookup pattern (Python, zero deps):
+### Start here — compact project map (~10k tokens):
+```bash
+repo2kg summary --kg {kg_rel}
+```
+Shows all files, classes and functions grouped by directory. Much cheaper than
+reading CODEBASE.md (~60k tokens). Follow up with targeted queries.
+
+### Targeted search:
+```bash
+repo2kg query "<topic>" --kg {kg_rel}      # semantic (FAISS)
+repo2kg query-lite "<keyword>" --kg {kg_rel}  # instant keyword, no deps
+```
+
+### Quick inline lookup (Python, zero deps):
 ```python
 import json
 kg = json.load(open("{kg_rel}"))
-# Find nodes by name/keyword:
 for nid, n in kg.items():
     if "KEYWORD" in nid.lower() or "KEYWORD" in n.get("name","").lower():
         print(n["signature"], "—", n.get("docstring","")[:100])
         print("calls:", [c.split("::")[-1] for c in n.get("calls",[])])
 ```
 
-### Full overview: Read `CODEBASE.md` for architecture, file map, and all signatures.
-
 ### Best practices:
-- Use the KG to find relevant code before reading source files
+- Run `repo2kg summary` first, then `repo2kg query` for specifics
 - Follow call edges (`calls` / `callers` fields) to trace execution flow
 - Body previews (first 8 lines) are in `body_preview` field
 """
@@ -2995,13 +3014,11 @@ for nid, n in kg.items():
 
 This project has a code knowledge graph. Before exploring source files:
 
-1. Read `CODEBASE.md` for a full project overview
-2. Query `{kg_rel}` for specific code details:
-   ```python
-   import json; kg = json.load(open("{kg_rel}"))
-   matches = [n for n in kg.values() if "KEYWORD" in n["name"].lower()]
-   ```
+1. Run `repo2kg summary --kg {kg_rel}` for a compact project map (~10k tokens)
+2. Run `repo2kg query "<topic>" --kg {kg_rel}` for targeted deep dives (~400 tokens)
 3. Only read source files when you need implementation details beyond the 8-line preview
+
+Do NOT use `cat CODEBASE.md` — it's ~60k tokens. Use `summary` + `query` instead.
 """
 
     # ── .agents.md (for multi-agent systems) ─────────────────────────
@@ -3318,10 +3335,12 @@ For any Python project you open, check if it has a registered knowledge graph:
 
 ### Workflow for every task:
 1. Run the lookup above to find the project's KG
-2. If a KG exists, read `CODEBASE.md` (project dir) for architecture overview
-3. Query `kg.json` with the snippet above instead of reading source files
+2. If a KG exists, run `repo2kg summary --kg <kg_path>` for a compact project map (~10k tokens)
+3. Run `repo2kg query "<topic>" --kg <kg_path>` for targeted deep dives (~400 tokens/query)
 4. Only read actual source files when the 8-line body preview is not enough
 5. Follow `calls`/`callers` fields to trace dependencies
+
+Do NOT load CODEBASE.md for every task — it can exceed 60k tokens. Use summary + query instead.
 
 ### Node schema (what's in kg.json)
 ```
@@ -3470,17 +3489,18 @@ def print_tool_info():
             },
         },
         "quick_start": [
-            "repo2kg build --repo . --out kg.json       # Build KG (JSON)",
             "repo2kg build --repo . --out kg.toon       # Build KG (TOON, 40% fewer tokens)",
-            "repo2kg query-lite 'auth' --kg kg.json     # Search (no heavy deps)",
-            "repo2kg export --kg kg.json                # Generate CODEBASE.md",
-            "repo2kg agent-setup --kg kg.json --dir .   # Full agent setup",
+            "repo2kg summary --kg kg.toon               # Compact project map (~10k tokens) — start here",
+            "repo2kg query 'auth flow' --kg kg.toon     # Semantic deep dive (~400 tokens/query)",
+            "repo2kg query-lite 'auth' --kg kg.toon     # Instant keyword search (no FAISS)",
+            "repo2kg agent-setup --kg kg.toon --dir .   # Generate CLAUDE.md + .copilot-instructions.md",
         ],
         "agent_tips": [
-            "Prefer query-lite over query — it needs zero heavy dependencies",
-            "Read CODEBASE.md for a full project overview (no tool calls needed)",
+            "Run 'repo2kg summary' first — it covers the whole codebase in ~10k tokens vs ~60k for export",
+            "Then use 'repo2kg query' for targeted deep dives — ~400 tokens per query",
+            "Total context: ~11k tokens (summary + 3 queries) vs ~60k for CODEBASE.md — 83% savings",
+            "Prefer query-lite over query when you know the symbol name — zero heavy dependencies",
             "Use --format json for structured output you can parse programmatically",
-            "KG supports .json and .toon formats — auto-detected from extension",
             "TOON format uses ~40% fewer tokens than JSON — best for LLM context windows",
             "Supports Python, JavaScript, TypeScript, Java, Go, Rust, C, C++, Ruby, C#",
         ],
@@ -3533,20 +3553,27 @@ Recommended Agent Workflow (minimal token cost):
   repo2kg query "auth flow" --kg kg.toon     # 3. Deep dive (~400 tokens/query)
   repo2kg query-lite "login" --kg kg.toon    # 3b. Instant keyword search (no ML)
 
-  Total: ~11k tokens vs ~60k for a full export — 83% savings.
-
 Agent Setup:
   repo2kg agent-setup --kg kg.toon --dir .   # CLAUDE.md + .copilot-instructions.md
   repo2kg user-setup                         # Global agent instructions (run once)
 
-Discovery:
+Discovery & Registry:
   repo2kg scan --root ~                      # Auto-discover all KGs under home
+  repo2kg register --kg kg.toon --name myproject  # Register a KG manually
   repo2kg list                               # Show registered projects
+  repo2kg stats --kg kg.toon                 # Show KG statistics (nodes, edges, files)
   repo2kg info                               # Machine-readable tool info (JSON)
 
-Full Export (only when you need everything):
-  repo2kg export --kg kg.toon --out CODEBASE.md  # ~60k tokens — use sparingly
-  repo2kg summary --kg kg.toon --out SUMMARY.md  # ~10k tokens — preferred
+Visualization:
+  repo2kg visualize --kg kg.toon --out graph.html  # Interactive D3.js HTML graph
+
+Export (full snapshot — use sparingly):
+  repo2kg summary --kg kg.toon --out SUMMARY.md    # ~10k tokens — preferred
+  repo2kg export --kg kg.toon --out CODEBASE.md    # ~60k tokens — use sparingly
+
+Advanced:
+  repo2kg set-model all-mpnet-base-v2    # Change embedding model (used by build + query)
+  repo2kg set-model all-mpnet-base-v2 --delete-old  # Also remove old cached model
 
 Formats:
   .json  — Default. Compact, fast, universal.
@@ -3573,7 +3600,7 @@ def main():
     sub = parser.add_subparsers(dest="cmd")
 
     # ── build ──
-    build_p = sub.add_parser("build", help="Build KG from a repository (all supported languages)",
+    build_p = sub.add_parser("build", help="Build KG from a repository",
                              description="Parse source files (Python/JS/TS/Java/Go/Rust/C/C++/Ruby/C#), "
                                          "extract functions/classes/methods, "
                                          "resolve call edges, build FAISS index, and save to JSON or TOON.")
@@ -3583,7 +3610,7 @@ def main():
     build_p.add_argument("--exclude", nargs="*", help="Additional directory patterns to exclude")
 
     # ── query (semantic, requires FAISS) ──
-    query_p = sub.add_parser("query", help="Query the KG with natural language (requires FAISS)")
+    query_p = sub.add_parser("query", help="Semantic search (requires FAISS)")
     query_p.add_argument("question", help="Natural language question")
     query_p.add_argument("--kg", default="kg.json",
                          help="Path to saved KG .json/.toon (default: kg.json)")
@@ -3594,7 +3621,7 @@ def main():
 
     # ── query-lite (keyword, no heavy deps) ──
     qlite_p = sub.add_parser("query-lite",
-                             help="Query KG with keyword matching (no FAISS/embeddings needed)")
+                             help="Keyword search (zero dependencies)")
     qlite_p.add_argument("keywords", help="Keywords to search for")
     qlite_p.add_argument("--kg", default="kg.json",
                          help="Path to saved KG .json/.toon (default: kg.json)")
@@ -3606,7 +3633,7 @@ def main():
     # ── export (generate CODEBASE.md) ──
     export_p = sub.add_parser(
         "export",
-        help="Export full KG as CODEBASE.md (~60k tokens for large projects — use 'summary' instead for agents)",
+        help="Export as CODEBASE.md (~60k tokens for large projects — prefer 'summary' for agents)",
         description=(
             "Generates a complete CODEBASE.md with every symbol, signature, docstring, "
             "call graph, and entry points.\n\n"
@@ -3623,7 +3650,7 @@ def main():
     # ── summary (compact map, ~10× fewer tokens than CODEBASE.md) ──
     summary_p = sub.add_parser(
         "summary",
-        help="Print a compact project map (classes + functions only, no methods) — ~10× fewer tokens than export",
+        help="Compact project map (~10k tokens) — classes + functions only, no methods",
         description=(
             "Outputs a directory-grouped file map showing only top-level classes and "
             "standalone functions. Methods are omitted. Ideal as the first context "
@@ -3638,7 +3665,7 @@ def main():
 
     # ── agent-setup ──
     agent_p = sub.add_parser("agent-setup",
-                             help="Generate agent instruction files (CLAUDE.md, .copilot-instructions.md, etc.)")
+                             help="Generate all agent instruction files (CLAUDE.md, .copilot-instructions.md, AGENTS.md)")
     agent_p.add_argument("--kg", default="kg.json",
                          help="Path to saved KG .json/.toon (default: kg.json)")
     agent_p.add_argument("--dir", default=".",
@@ -3648,11 +3675,11 @@ def main():
 
     # ── user-setup (global agent instructions) ──
     sub.add_parser("user-setup",
-                   help="Install global agent instructions (~/.claude/CLAUDE.md, ~/.codex/AGENTS.md, etc.)")
+                   help="Install global agent instructions (run once — ~/.claude/CLAUDE.md, ~/.codex/AGENTS.md, etc.)")
 
     # ── register ──
     reg_p = sub.add_parser("register",
-                           help="Register a project KG in the global ~/.repo2kg/registry.json")
+                           help="Register a single project KG manually in the global registry")
     reg_p.add_argument("--kg", default="kg.json",
                        help="Path to saved KG .json/.toon (default: kg.json)")
     reg_p.add_argument("--project", default=".",
@@ -3660,25 +3687,25 @@ def main():
 
     # ── scan ──
     scan_p = sub.add_parser("scan",
-                            help="Scan a directory tree, find all KG files, and register them globally")
+                            help="Auto-discover and register all KGs under a directory")
     scan_p.add_argument("--root", default=str(Path.home()),
                         help="Root directory to scan (default: home directory)")
 
     # ── list (show registered projects) ──
-    sub.add_parser("list", help="List all projects registered in the global registry")
+    sub.add_parser("list", help="Show all registered projects")
 
     # ── info (machine-readable tool discovery for agents) ──
     sub.add_parser("info",
-                   help="Print machine-readable tool info (JSON) — for agent discovery")
+                   help="Print machine-readable tool info (JSON) — for agents")
 
     # ── stats ──
-    stats_p = sub.add_parser("stats", help="Show KG statistics")
+    stats_p = sub.add_parser("stats", help="Show KG node/edge/file statistics")
     stats_p.add_argument("--kg", default="kg.json", help="Path to saved KG (default: kg.json)")
 
     # ── set-model (change embedding model) ──
     setm_p = sub.add_parser(
         "set-model",
-        help="Change the default embedding model (HuggingFace model name)",
+        help="Change the embedding model used by 'build' and 'query' (HuggingFace model name)",
         description=(
             "Set the SentenceTransformer model used by 'build' and 'query'. "
             "The model is downloaded immediately. Note: 'query-lite' uses keyword search "
@@ -3694,7 +3721,7 @@ def main():
     # ── visualize (interactive HTML graph for humans) ──
     viz_p = sub.add_parser(
         "visualize",
-        help="Generate an interactive HTML knowledge-graph visualization (for humans)",
+        help="Generate an interactive HTML graph — open in any browser, no server needed",
         description=(
             "Creates a self-contained HTML file with a D3.js force-directed graph. "
             "Open in any browser — no server needed. "
