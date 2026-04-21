@@ -78,6 +78,13 @@ DEFAULT_EXCLUDE = [
     "dist", "build", "site-packages",
 ]
 
+# Marker pair used to identify repo2kg-managed sections in shared files.
+# Content between these markers is replaced on re-run; content outside is preserved.
+_REPO2KG_MARKER = "<!-- repo2kg-start -->"
+_REPO2KG_END_MARKER = "<!-- repo2kg-end -->"
+
+CONFIG_PATH = REPO2KG_HOME / "config.json"
+
 
 # ─────────────────────────────────────────────
 # DATA STRUCTURES
@@ -1618,8 +1625,9 @@ def parse_file(file_path: str, repo_root: str = "") -> list[CodeNode]:
 # ─────────────────────────────────────────────
 
 class RepoKG:
-    def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
+    def __init__(self, model_name: str | None = None):
         _load_heavy_deps()
+        model_name = model_name or _default_model()
         self.nodes: dict[str, CodeNode] = {}
         self.model = _SentenceTransformer(model_name)
         self._index = None   # faiss.IndexFlatL2
@@ -2104,6 +2112,304 @@ def export_codebase_md(kg_path: str, out_path: str):
     print(f"Exported {out_path} ({len(nodes)} nodes, ~{token_estimate} tokens)")
 
 
+# ─────────────────────────────────────────────
+# VISUAL GRAPH (interactive HTML for humans)
+# ─────────────────────────────────────────────
+
+def generate_visual_graph(kg_path: str, out_path: str, max_nodes: int = 800) -> None:
+    """
+    Generate a self-contained interactive HTML knowledge-graph visualization.
+
+    Opens in any browser — no server needed.  Uses D3 v7 (CDN) for a
+    force-directed layout with:
+      • Node colours by kind  (class=blue / function=green / method=orange)
+      • Directed call edges with arrow heads
+      • Hover tooltip  — name, kind, file, docstring, signature, calls
+      • Click to highlight a node and its direct neighbours
+      • Keyword search box — filters visible nodes in real time
+      • Filter buttons  — toggle classes / functions / methods
+      • Drag-to-pin, zoom, pan
+
+    Large KGs (>max_nodes nodes) are capped: the most-connected nodes are kept.
+    """
+    fmt = _detect_format(kg_path)
+    with open(kg_path) as f:
+        data = deserialize_toon(f.read()) if fmt == "toon" else json.load(f)
+
+    nodes_dict = {nid: CodeNode(**nd) for nid, nd in data.items()}
+    title = os.path.splitext(os.path.basename(kg_path))[0]
+
+    # If the KG is very large, keep the top max_nodes most-connected nodes.
+    if len(nodes_dict) > max_nodes:
+        print(f"KG has {len(nodes_dict)} nodes — limiting to {max_nodes} most-connected for rendering.")
+        ranked = sorted(
+            nodes_dict.values(),
+            key=lambda n: len(n.calls) + len(n.callers),
+            reverse=True,
+        )
+        keep_ids = {n.id for n in ranked[:max_nodes]}
+        nodes_dict = {nid: n for nid, n in nodes_dict.items() if nid in keep_ids}
+
+    keep_ids = set(nodes_dict.keys())
+
+    nodes_json: list[dict] = []
+    for n in nodes_dict.values():
+        nodes_json.append({
+            "id": n.id,
+            "name": n.name,
+            "kind": n.kind,
+            "file": n.file,
+            "parent_class": n.parent_class or "",
+            "signature": n.signature[:150],
+            "docstring": (n.docstring or "")[:250],
+            "calls": [c.split("::")[-1] for c in n.calls[:8]],
+            "callers": [c.split("::")[-1] for c in n.callers[:8]],
+        })
+
+    links_json: list[dict] = []
+    seen_links: set[tuple] = set()
+    for n in nodes_dict.values():
+        for callee_id in n.calls:
+            if callee_id in keep_ids:
+                key = (n.id, callee_id)
+                if key not in seen_links:
+                    seen_links.add(key)
+                    links_json.append({"source": n.id, "target": callee_id})
+
+    graph_data = json.dumps({"nodes": nodes_json, "links": links_json}, ensure_ascii=False)
+    node_count = len(nodes_json)
+    link_count = len(links_json)
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>repo2kg — {title}</title>
+<style>
+  *{{box-sizing:border-box;margin:0;padding:0}}
+  body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0d1117;color:#c9d1d9;overflow:hidden}}
+  #controls{{position:fixed;top:0;left:0;right:0;z-index:10;background:#161b22;border-bottom:1px solid #30363d;
+    padding:8px 16px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}}
+  #search{{background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#c9d1d9;
+    padding:4px 10px;font-size:13px;width:200px}}
+  #search:focus{{outline:none;border-color:#58a6ff}}
+  .fbtn{{background:none;border:1px solid #30363d;border-radius:4px;color:#8b949e;
+    padding:3px 10px;cursor:pointer;font-size:12px;transition:all .15s}}
+  .fbtn.on{{border-color:#58a6ff;color:#c9d1d9;background:#21262d}}
+  #legend{{display:flex;gap:10px;align-items:center;margin-left:auto;font-size:12px}}
+  .dot{{width:10px;height:10px;border-radius:50%;display:inline-block;margin-right:3px}}
+  #info{{font-size:11px;color:#6e7681}}
+  #tip{{position:fixed;background:#1c2128;border:1px solid #373e47;border-radius:8px;
+    padding:10px 14px;font-size:12px;max-width:320px;pointer-events:none;opacity:0;
+    transition:opacity .15s;z-index:100;line-height:1.5}}
+  #tip h4{{margin:0 0 4px;color:#58a6ff;font-size:13px}}
+  #tip .m{{color:#8b949e;margin:2px 0}}
+  #tip .sig{{font-family:monospace;font-size:11px;color:#d2a8ff;margin:4px 0;
+    white-space:pre-wrap;word-break:break-all;max-height:80px;overflow:hidden}}
+  svg{{width:100vw;height:100vh;cursor:grab}}
+  svg.dragging{{cursor:grabbing}}
+  .link{{stroke:#30363d;stroke-opacity:.7;fill:none;marker-end:url(#arr)}}
+  .link.hl{{stroke:#f78166;stroke-opacity:1;stroke-width:2}}
+  .node circle{{stroke-width:1.5;cursor:pointer}}
+  .node text{{font-size:9px;fill:#6e7681;pointer-events:none;dominant-baseline:middle}}
+  .node.sel circle{{stroke:#f0e68c!important;stroke-width:3}}
+  .node.dim{{opacity:.12}}
+</style>
+</head>
+<body>
+<div id="controls">
+  <input id="search" type="text" placeholder="Search nodes…" autocomplete="off">
+  <button class="fbtn on" data-k="class">Classes</button>
+  <button class="fbtn on" data-k="function">Functions</button>
+  <button class="fbtn on" data-k="method">Methods</button>
+  <div id="legend">
+    <span><span class="dot" style="background:#79c0ff"></span>Class</span>
+    <span><span class="dot" style="background:#7ee787"></span>Function</span>
+    <span><span class="dot" style="background:#ffa657"></span>Method</span>
+  </div>
+  <span id="info">{node_count} nodes · {link_count} edges</span>
+</div>
+<div id="tip"></div>
+<svg>
+  <defs>
+    <marker id="arr" viewBox="0 -3 6 6" refX="15" refY="0"
+            markerWidth="4" markerHeight="4" orient="auto">
+      <path d="M0,-3L6,0L0,3" fill="#484f58"/>
+    </marker>
+  </defs>
+  <g id="zg">
+    <g id="lg"></g>
+    <g id="ng"></g>
+  </g>
+</svg>
+<script src="https://d3js.org/d3.v7.min.js"></script>
+<script>
+const DATA = {graph_data};
+const KC = {{class:"#79c0ff",function:"#7ee787",method:"#ffa657"}};
+const KR = {{class:9,function:6,method:5}};
+let active = new Set(["class","function","method"]);
+let sel = null;
+
+const svg = d3.select("svg");
+const g   = svg.select("#zg");
+const tip = document.getElementById("tip");
+
+const zoom = d3.zoom().scaleExtent([0.03,8]).on("zoom", e => {{
+  g.attr("transform", e.transform);
+  svg.classed("dragging", e.sourceEvent && e.sourceEvent.buttons === 1);
+}});
+svg.call(zoom).on("dblclick.zoom", null);
+
+const W = window.innerWidth, H = window.innerHeight;
+const sim = d3.forceSimulation()
+  .force("link",  d3.forceLink().id(d=>d.id).distance(60).strength(0.5))
+  .force("charge",d3.forceManyBody().strength(-150))
+  .force("center",d3.forceCenter(W/2, H/2))
+  .force("x",     d3.forceX(W/2).strength(0.03))
+  .force("y",     d3.forceY(H/2).strength(0.03))
+  .force("coll",  d3.forceCollide(14));
+
+let linkSel, nodeSel;
+
+function visible() {{
+  const q = document.getElementById("search").value.toLowerCase().trim();
+  return DATA.nodes.filter(n => {{
+    if (!active.has(n.kind)) return false;
+    if (q && !n.name.toLowerCase().includes(q) && !n.file.toLowerCase().includes(q)) return false;
+    return true;
+  }});
+}}
+
+function render() {{
+  const vis    = visible();
+  const visSet = new Set(vis.map(n=>n.id));
+  const visLinks = DATA.links.filter(l =>
+    visSet.has(typeof l.source==="object"?l.source.id:l.source) &&
+    visSet.has(typeof l.target==="object"?l.target.id:l.target));
+
+  document.getElementById("info").textContent =
+    vis.length + " nodes · " + visLinks.length + " edges";
+
+  // Links
+  linkSel = g.select("#lg").selectAll(".link")
+    .data(visLinks, d=>`${{d.source.id||d.source}}-${{d.target.id||d.target}}`);
+  linkSel.enter().append("line").attr("class","link").merge(linkSel);
+  linkSel.exit().remove();
+  linkSel = g.select("#lg").selectAll(".link");
+
+  // Nodes
+  const nd = g.select("#ng").selectAll(".node").data(vis, d=>d.id);
+  const ndE = nd.enter().append("g").attr("class","node")
+    .call(d3.drag()
+      .on("start",(e,d)=>{{if(!e.active)sim.alphaTarget(0.3).restart();d.fx=d.x;d.fy=d.y}})
+      .on("drag", (e,d)=>{{d.fx=e.x;d.fy=e.y}})
+      .on("end",  (e,d)=>{{if(!e.active)sim.alphaTarget(0);d.fx=null;d.fy=null}}))
+    .on("click", (_,d)=>{{sel=sel===d.id?null:d.id;paint()}})
+    .on("mouseover",(e,d)=>showTip(e,d))
+    .on("mousemove",(e)=>moveTip(e))
+    .on("mouseout", ()=>{{tip.style.opacity=0}});
+  ndE.append("circle")
+    .attr("r",d=>KR[d.kind]||5)
+    .attr("fill",d=>KC[d.kind]||"#8b949e")
+    .attr("stroke",d=>d3.color(KC[d.kind]||"#8b949e").darker(0.6));
+  ndE.append("text").attr("dx",d=>(KR[d.kind]||5)+4).attr("dy","0.35em").text(d=>d.name);
+  nd.exit().remove();
+  nodeSel = g.select("#ng").selectAll(".node");
+
+  sim.nodes(vis).on("tick", ()=>{{
+    linkSel
+      .attr("x1",d=>d.source.x).attr("y1",d=>d.source.y)
+      .attr("x2",d=>d.target.x).attr("y2",d=>d.target.y);
+    nodeSel.attr("transform",d=>`translate(${{d.x}},${{d.y}})`);
+  }});
+  sim.force("link").links(visLinks);
+  sim.alpha(0.5).restart();
+  paint();
+}}
+
+function connectedIds(id) {{
+  const ids = new Set([id]);
+  (linkSel||d3.selectAll(".link")).each(d=>{{
+    const s=d.source.id||d.source, t=d.target.id||d.target;
+    if(s===id) ids.add(t);
+    if(t===id) ids.add(s);
+  }});
+  return ids;
+}}
+
+function paint() {{
+  if (!nodeSel) return;
+  if (!sel) {{
+    nodeSel.classed("sel",false).classed("dim",false);
+    if(linkSel) linkSel.classed("hl",false);
+    return;
+  }}
+  const nb = connectedIds(sel);
+  nodeSel.classed("sel",d=>d.id===sel).classed("dim",d=>!nb.has(d.id));
+  if(linkSel) linkSel.classed("hl",d=>{{
+    const s=d.source.id||d.source,t=d.target.id||d.target;
+    return (s===sel||t===sel);
+  }});
+}}
+
+function showTip(e, d) {{
+  const calls   = (d.calls||[]).slice(0,6).join(", ");
+  const callers = (d.callers||[]).slice(0,6).join(", ");
+  tip.innerHTML = `
+    <h4>${{d.name}}</h4>
+    <div class="m"><b>${{d.kind}}</b> · ${{d.file}}</div>
+    ${{d.docstring?`<div class="m">${{d.docstring.slice(0,200)}}</div>`:""}}
+    <div class="sig">${{(d.signature||"").slice(0,130)}}</div>
+    ${{calls?`<div class="m">→ calls: ${{calls}}</div>`:""}}
+    ${{callers?`<div class="m">← by: ${{callers}}</div>`:""}}
+  `;
+  tip.style.opacity = 1;
+  moveTip(e);
+}}
+function moveTip(e) {{
+  const x = Math.min(e.clientX+18, window.innerWidth-340);
+  const y = Math.min(e.clientY+12, window.innerHeight-200);
+  tip.style.left = x+"px"; tip.style.top = y+"px";
+}}
+
+document.querySelectorAll(".fbtn").forEach(b=>b.addEventListener("click",()=>{{
+  const k=b.dataset.k;
+  if(active.has(k)){{active.delete(k);b.classList.remove("on")}}
+  else{{active.add(k);b.classList.add("on")}}
+  render();
+}}));
+
+let st;
+document.getElementById("search").addEventListener("input",()=>{{
+  clearTimeout(st); st=setTimeout(render,250);
+}});
+
+svg.on("click",(e)=>{{
+  if(e.target===svg.node()||e.target===g.node()){{sel=null;paint()}}
+}});
+
+render();
+
+// Auto-fit on first render
+setTimeout(()=>{{
+  const bounds = g.node().getBBox();
+  if(bounds.width>0){{
+    const scale = Math.min(0.9, Math.min(W/bounds.width, (H-48)/bounds.height));
+    const tx = (W - bounds.width*scale)/2 - bounds.x*scale;
+    const ty = (H - bounds.height*scale)/2 - bounds.y*scale + 24;
+    svg.call(zoom.transform, d3.zoomIdentity.translate(tx,ty).scale(scale));
+  }}
+}}, 2500);
+</script>
+</body>
+</html>"""
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(html)
+    print(f"Visual graph saved to {out_path} ({node_count} nodes, {link_count} edges)")
+    print(f"Open in browser: file://{os.path.abspath(out_path)}")
+
+
 def generate_agent_instructions(kg_path: str, target_dir: str):
     """Generate CLAUDE.md and .copilot-instructions.md so agents auto-discover the KG."""
     fmt = _detect_format(kg_path)
@@ -2221,26 +2527,6 @@ This project has a code knowledge graph. Before exploring source files:
 3. Only read source files when you need implementation details beyond the 8-line preview
 """
 
-    # Write files
-    os.makedirs(target_dir, exist_ok=True)
-
-    claude_path = os.path.join(target_dir, "CLAUDE.md")
-    with open(claude_path, "w") as f:
-        f.write(claude_md)
-    print(f"Created {claude_path}")
-
-    copilot_path = os.path.join(target_dir, ".copilot-instructions.md")
-    with open(copilot_path, "w") as f:
-        f.write(copilot_md)
-    print(f"Created {copilot_path}")
-
-    github_dir = os.path.join(target_dir, ".github")
-    os.makedirs(github_dir, exist_ok=True)
-    copilot_agent_path = os.path.join(github_dir, "copilot-instructions.md")
-    with open(copilot_agent_path, "w") as f:
-        f.write(copilot_agent_md)
-    print(f"Created {copilot_agent_path}")
-
     # ── .agents.md (for multi-agent systems) ─────────────────────────
     agents_md = f"""# Agent Configuration
 
@@ -2279,10 +2565,25 @@ This project has a code knowledge graph. Before exploring source files:
 4. **By kind**: Filter `kind == "class"` for architecture overview
 5. **By docstring**: Search `docstring` field for domain concepts
 """
-    agents_path = os.path.join(target_dir, "AGENTS.md")
-    with open(agents_path, "w") as f:
-        f.write(agents_md)
-    print(f"Created {agents_path}")
+
+    # ── Write / merge files ────────────────────────────────────────────
+    # All files use marker-based merge: existing user content outside the
+    # <!-- repo2kg-start/end --> markers is preserved on re-runs.
+    os.makedirs(target_dir, exist_ok=True)
+
+    def _write_merged(rel_path: str, content: str, verb: str = "Updated") -> None:
+        full_path = Path(os.path.join(target_dir, rel_path))
+        full_path.parent.mkdir(parents=True, exist_ok=True)
+        block = f"{_REPO2KG_MARKER}\n{content.strip()}\n{_REPO2KG_END_MARKER}\n"
+        existed = full_path.exists()
+        _merge_file_with_block(full_path, block)
+        action = "Merged →" if existed else "Created  "
+        print(f"{action} {full_path}")
+
+    _write_merged("CLAUDE.md", claude_md)
+    _write_merged(".copilot-instructions.md", copilot_md)
+    _write_merged(".github/copilot-instructions.md", copilot_agent_md)
+    _write_merged("AGENTS.md", agents_md)
 
 
 # ─────────────────────────────────────────────
@@ -2300,6 +2601,107 @@ def _save_registry(reg: dict):
     REPO2KG_HOME.mkdir(parents=True, exist_ok=True)
     with open(REGISTRY_PATH, "w") as f:
         json.dump(reg, f, indent=2)
+
+
+# ─────────────────────────────────────────────
+# CONFIGURATION (embedding model, etc.)
+# ─────────────────────────────────────────────
+
+def _load_config() -> dict:
+    if CONFIG_PATH.exists():
+        with open(CONFIG_PATH) as f:
+            return json.load(f)
+    return {}
+
+
+def _save_config(config: dict):
+    REPO2KG_HOME.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(config, f, indent=2)
+
+
+def _default_model() -> str:
+    """Return the configured embedding model name (or the built-in default)."""
+    return _load_config().get("model", "all-MiniLM-L6-v2")
+
+
+def _merge_file_with_block(file_path: Path, new_block: str) -> None:
+    """
+    Write new_block into file_path using marker-based merge.
+    If markers already exist the section between them is replaced.
+    Otherwise the block is appended, preserving all existing content.
+    """
+    existing = file_path.read_text() if file_path.exists() else ""
+    if _REPO2KG_MARKER in existing:
+        new_content = _re.sub(
+            rf"{_re.escape(_REPO2KG_MARKER)}.*?{_re.escape(_REPO2KG_END_MARKER)}",
+            new_block.strip(),
+            existing,
+            flags=_re.DOTALL,
+        )
+    else:
+        new_content = existing.rstrip() + ("\n\n" if existing else "") + new_block
+    file_path.write_text(new_content)
+
+
+def _delete_cached_model(model_name: str) -> None:
+    """
+    Delete a cached SentenceTransformer / HuggingFace model from disk.
+    Checks both the modern HF Hub cache and the legacy torch cache.
+    """
+    import shutil
+
+    # Modern HuggingFace Hub cache layout:
+    # ~/.cache/huggingface/hub/models--<org>--<name>/
+    hf_cache = Path.home() / ".cache" / "huggingface" / "hub"
+    if "/" in model_name:
+        org, name = model_name.split("/", 1)
+        hf_dir_name = f"models--{org}--{name}"
+    else:
+        hf_dir_name = f"models--sentence-transformers--{model_name}"
+    hf_model_path = hf_cache / hf_dir_name
+
+    # Legacy SentenceTransformer cache:
+    # ~/.cache/torch/sentence_transformers/<model_name>/
+    st_cache = Path.home() / ".cache" / "torch" / "sentence_transformers"
+    st_model_name = model_name.replace("/", "_")
+    st_model_path = st_cache / st_model_name
+
+    deleted: list[str] = []
+    for path in [hf_model_path, st_model_path]:
+        if path.exists():
+            shutil.rmtree(path)
+            deleted.append(str(path))
+
+    if deleted:
+        for p in deleted:
+            print(f"Deleted cached model: {p}")
+    else:
+        print(f"No cached model found for '{model_name}' (cache already clean)")
+
+
+def cmd_set_model(model_name: str, delete_old: bool = False) -> None:
+    """
+    Change the default embedding model used by 'build' and 'query'.
+    Optionally delete the previously cached model to free disk space.
+    The new model is downloaded immediately so the next 'build' is fast.
+    """
+    config = _load_config()
+    old_model = config.get("model", "all-MiniLM-L6-v2")
+
+    if delete_old and old_model != model_name:
+        print(f"Deleting old model '{old_model}' from cache…")
+        _delete_cached_model(old_model)
+
+    config["model"] = model_name
+    _save_config(config)
+    print(f"Default embedding model set to: {model_name}")
+
+    # Pre-download so the first 'build' doesn't have to wait
+    print(f"Downloading '{model_name}' (this may take a moment)…")
+    _load_heavy_deps()
+    _SentenceTransformer(model_name)
+    print(f"Model '{model_name}' is ready.")
 
 
 def register_project(kg_path: str, project_dir: str, *, silent: bool = False):
@@ -2506,7 +2908,8 @@ Node fields: `name`, `kind`, `file`, `signature`, `docstring`, `body_preview`, `
     # ── ~/.repo2kg/GLOBAL_AGENTS.md ─────────────────────────────────
     REPO2KG_HOME.mkdir(parents=True, exist_ok=True)
     global_ref = REPO2KG_HOME / "GLOBAL_AGENTS.md"
-    global_ref.write_text(f"""# repo2kg Global Agent Reference
+    global_block = f"""{_REPO2KG_MARKER}
+# repo2kg Global Agent Reference
 
 ## Registry
 `{registry_path_str}` — maps project paths to their KG files.
@@ -2544,7 +2947,9 @@ repo2kg agent-setup --kg kg.json --dir .
   }}
 }}
 ```
-""")
+{_REPO2KG_END_MARKER}
+"""
+    _merge_file_with_block(global_ref, global_block)
     print(f"Updated {global_ref}")
 
 
@@ -2786,6 +3191,40 @@ def main():
     stats_p = sub.add_parser("stats", help="Show KG statistics")
     stats_p.add_argument("--kg", default="kg.json", help="Path to saved KG (default: kg.json)")
 
+    # ── set-model (change embedding model) ──
+    setm_p = sub.add_parser(
+        "set-model",
+        help="Change the default embedding model (HuggingFace model name)",
+        description=(
+            "Set the SentenceTransformer model used by 'build' and 'query'. "
+            "The model is downloaded immediately. Note: 'query-lite' uses keyword search "
+            "and never loads embeddings — use 'query' for semantic accuracy."
+        ),
+    )
+    setm_p.add_argument("model", help="HuggingFace model name, e.g. 'sentence-transformers/all-mpnet-base-v2'")
+    setm_p.add_argument(
+        "--delete-old", action="store_true",
+        help="Delete the previously cached model from disk to free space",
+    )
+
+    # ── visualize (interactive HTML graph for humans) ──
+    viz_p = sub.add_parser(
+        "visualize",
+        help="Generate an interactive HTML knowledge-graph visualization (for humans)",
+        description=(
+            "Creates a self-contained HTML file with a D3.js force-directed graph. "
+            "Open in any browser — no server needed. "
+            "Nodes are coloured by kind; edges show call relationships. "
+            "Supports search, kind filters, hover tooltips, and zoom/pan."
+        ),
+    )
+    viz_p.add_argument("--kg", default="kg.json",
+                       help="Path to saved KG .json/.toon (default: kg.json)")
+    viz_p.add_argument("--out", default="kg_graph.html",
+                       help="Output HTML file (default: kg_graph.html)")
+    viz_p.add_argument("--max-nodes", type=int, default=800,
+                       help="Cap on nodes rendered (most-connected kept, default: 800)")
+
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -2874,11 +3313,21 @@ def main():
         functions = sum(1 for n in kg.nodes.values() if n.kind == "function")
         methods = sum(1 for n in kg.nodes.values() if n.kind == "method")
         edges = sum(len(n.calls) for n in kg.nodes.values())
+        model_in_use = _default_model()
         print(f"Knowledge Graph Statistics:")
-        print(f"  Files:     {len(files)}")
-        print(f"  Nodes:     {len(kg.nodes)} ({classes} classes, {functions} functions, {methods} methods)")
-        print(f"  Edges:     {edges} call edges")
-        print(f"  Avg edges: {edges / max(len(kg.nodes), 1):.1f} per node")
+        print(f"  Files:         {len(files)}")
+        print(f"  Nodes:         {len(kg.nodes)} ({classes} classes, {functions} functions, {methods} methods)")
+        print(f"  Edges:         {edges} call edges")
+        print(f"  Avg edges:     {edges / max(len(kg.nodes), 1):.1f} per node")
+        print(f"  Embedding model: {model_in_use}")
+        print(f"  Note: 'query-lite' uses keyword search (no embeddings).")
+        print(f"        Use 'repo2kg query' for semantic (embedding-based) search accuracy.")
+
+    elif args.cmd == "set-model":
+        cmd_set_model(args.model, delete_old=args.delete_old)
+
+    elif args.cmd == "visualize":
+        generate_visual_graph(args.kg, args.out, max_nodes=args.max_nodes)
 
     else:
         parser.print_help()
