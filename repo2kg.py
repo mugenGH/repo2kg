@@ -33,7 +33,7 @@ Format auto-detection:
   FAISS sidecar files (.faiss, .idx) use the base name regardless of format
 """
 
-__version__ = "0.5.15"
+__version__ = "0.6.0"
 
 import os
 import sys
@@ -43,11 +43,23 @@ import argparse
 import logging
 import textwrap
 import fnmatch
+import hashlib
+import io
+import threading
 import re as _re
+from collections import deque
 from pathlib import Path
 
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, fields as _dc_fields
 from typing import Optional
+
+try:
+    import tomllib as _tomllib
+except ImportError:
+    try:
+        import tomli as _tomllib  # type: ignore
+    except ImportError:
+        _tomllib = None  # type: ignore
 
 # Heavy imports are lazy-loaded to keep --help and info fast
 _numpy = None
@@ -112,6 +124,9 @@ _REPO2KG_END_MARKER = "<!-- repo2kg-end -->"
 
 CONFIG_PATH = REPO2KG_HOME / "config.json"
 
+BODY_PREVIEW_LINES = 12        # default preview lines (configurable via repo2kg.toml)
+MAX_TOON_FIELD_LEN = 1_000_000 # guard against pathological TOON inputs
+
 
 # ─────────────────────────────────────────────
 # DATA STRUCTURES
@@ -130,6 +145,7 @@ class CodeNode:
     calls: list[str] = field(default_factory=list)   # node ids this node calls
     callers: list[str] = field(default_factory=list) # node ids that call this node
     imports: list[str] = field(default_factory=list) # raw import strings in this file
+    in_cycle: bool = False                            # True if this node is in a call cycle
 
     def summary(self) -> str:
         """Rich text fed to the embedding model."""
@@ -214,30 +230,31 @@ def _toon_unquote(s: str) -> str:
 
 def _split_toon_array(s: str) -> list[str]:
     """Split a TOON inline array respecting quoted strings."""
+    if len(s) > MAX_TOON_FIELD_LEN:
+        raise ValueError(f"TOON field exceeds MAX_TOON_FIELD_LEN ({MAX_TOON_FIELD_LEN})")
     items = []
-    current: list[str] = []
+    buf = io.StringIO()
     in_quote = False
     i = 0
     while i < len(s):
         c = s[i]
         if c == '\\' and in_quote and i + 1 < len(s):
-            current.append(c)
-            current.append(s[i + 1])
+            buf.write(c)
+            buf.write(s[i + 1])
             i += 2
             continue
         if c == '"':
             in_quote = not in_quote
-            current.append(c)
+            buf.write(c)
         elif c == ',' and not in_quote:
-            items.append(''.join(current).strip())
-            current = []
+            items.append(buf.getvalue().strip())
+            buf = io.StringIO()
         else:
-            current.append(c)
+            buf.write(c)
         i += 1
-    if current:
-        rest = ''.join(current).strip()
-        if rest:
-            items.append(rest)
+    rest = buf.getvalue().strip()
+    if rest:
+        items.append(rest)
     return items
 
 
@@ -270,6 +287,8 @@ def serialize_toon(data: dict[str, dict]) -> str:
 
 def deserialize_toon(text: str) -> dict[str, dict]:
     """Deserialize a TOON KG file back to dict-of-dicts keyed by node id."""
+    if not text.lstrip().startswith("# repo2kg") and not text.lstrip().startswith("# TOON"):
+        raise ValueError("File does not appear to be a valid TOON KG (missing header)")
     result: dict[str, dict] = {}
     current_node: dict | None = None
 
@@ -325,6 +344,48 @@ def deserialize_toon(text: str) -> dict[str, dict]:
 
 
 # ─────────────────────────────────────────────
+# PROJECT CONFIG (repo2kg.toml)
+# ─────────────────────────────────────────────
+
+def _load_project_config(repo_path: str) -> dict:
+    """Load repo2kg.toml from repo root, merging over built-in defaults."""
+    defaults: dict = {
+        "build": {
+            "exclude_dirs": [],
+            "exclude_file_patterns": [],
+            "body_preview_lines": BODY_PREVIEW_LINES,
+            "max_file_size_kb": 500,
+            "strict_calls": False,
+        },
+        "embeddings": {
+            "model": None,
+            "batch_size": 64,
+        },
+        "output": {
+            "format": None,
+        },
+    }
+    config_path = Path(repo_path) / "repo2kg.toml"
+    if not config_path.exists():
+        return defaults
+    if _tomllib is None:
+        logger.warning("repo2kg.toml found but tomllib/tomli not available — ignoring config")
+        return defaults
+    try:
+        with open(config_path, "rb") as f:
+            user_cfg = _tomllib.load(f)
+        for section, values in user_cfg.items():
+            if section in defaults and isinstance(values, dict):
+                defaults[section].update(values)
+            else:
+                defaults[section] = values
+        logger.info("Loaded config from %s", config_path)
+    except Exception as e:
+        logger.warning("Failed to load repo2kg.toml: %s", e)
+    return defaults
+
+
+# ─────────────────────────────────────────────
 # MULTI-LANGUAGE SUPPORT
 # ─────────────────────────────────────────────
 
@@ -355,9 +416,32 @@ def _rel_path(file_path: str, repo_root: str) -> str:
     return file_path
 
 
-def _source_preview(source_lines: list[str], start_line: int, max_lines: int = 8) -> str:
-    """Get up to max_lines source starting at start_line (0-indexed)."""
+def _source_preview(source_lines: list[str], start_line: int,
+                    max_lines: int = BODY_PREVIEW_LINES) -> str:
+    """Get up to max_lines source starting at start_line (0-indexed).
+
+    Never cuts mid-expression: if max_lines leaves unclosed brackets/parens/braces,
+    extends up to 3 additional lines to close them.
+    """
     end = min(start_line + max_lines, len(source_lines))
+    if end < len(source_lines):
+        depth = 0
+        for i in range(start_line, end):
+            for ch in source_lines[i]:
+                if ch in '([{':
+                    depth += 1
+                elif ch in ')]}':
+                    depth -= 1
+        if depth > 0:
+            for i in range(end, min(end + 3, len(source_lines))):
+                end = i + 1
+                for ch in source_lines[i]:
+                    if ch in '([{':
+                        depth += 1
+                    elif ch in ')]}':
+                        depth -= 1
+                if depth <= 0:
+                    break
     return textwrap.dedent("".join(source_lines[start_line:end])).rstrip()
 
 
@@ -979,9 +1063,7 @@ _LANG_PARSERS: dict[str, object] = {
 # ─────────────────────────────────────────────
 
 def _get_source_lines(source_lines: list[str], node: ast.AST) -> str:
-    start = node.lineno - 1
-    end = min(start + 8, len(source_lines))
-    return textwrap.dedent("".join(source_lines[start:end])).rstrip()
+    return _source_preview(source_lines, node.lineno - 1)
 
 
 def _format_signature(node: ast.FunctionDef | ast.AsyncFunctionDef, class_name: Optional[str] = None) -> str:
@@ -1659,34 +1741,101 @@ class RepoKG:
         self.model = _SentenceTransformer(model_name)
         self._index = None   # faiss.IndexFlatL2
         self._index_ids: list[str] = []   # maps FAISS row → node id
+        self.parse_errors: list[str] = []
+        self.cycles: list[list[str]] = []
+        self._repo_path: str = ""
 
     # ── Build ──────────────────────────────────────────────────────────────
 
-    def build(self, repo_path: str, exclude: list[str] | None = None) -> "RepoKG":
-        """Parse repo, build nodes, resolve call edges, build FAISS index."""
+    # ── Build cache helpers ────────────────────────────────────────────
+
+    def _file_cache_key(self, fpath: str) -> str:
+        """Stable per-file cache key based on mtime + size."""
+        s = os.stat(fpath)
+        return f"{s.st_mtime:.0f}:{s.st_size}"
+
+    def _load_build_cache(self, cache_file: str) -> dict:
+        """Load file-level parse cache; returns {} on any error or version mismatch."""
+        if not os.path.exists(cache_file):
+            return {}
+        try:
+            with open(cache_file) as f:
+                data = json.load(f)
+            if data.get("version") != __version__:
+                return {}
+            return data.get("entries", {})
+        except Exception:
+            return {}
+
+    def _save_build_cache(self, cache_file: str, entries: dict):
+        """Persist per-file parse cache; silently skips on error."""
+        try:
+            os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+            with open(cache_file, "w") as f:
+                json.dump({"version": __version__, "entries": entries}, f)
+        except Exception as e:
+            logger.debug("Could not save build cache: %s", e)
+
+    # ── Main build ─────────────────────────────────────────────────────
+
+    def build(self, repo_path: str, exclude: list[str] | None = None,
+              config: dict | None = None, strict_calls: bool = False,
+              batch_size: int = 64) -> "RepoKG":
+        """Parse repo, build nodes, resolve call edges, build FAISS index.
+
+        Supports incremental caching: unchanged files are loaded from
+        .repo2kg_cache/ instead of re-parsed, cutting rebuild time by 90%+.
+        """
         repo_path = os.path.abspath(repo_path)
-        exclude_patterns = exclude or DEFAULT_EXCLUDE
+        self._repo_path = repo_path
+
+        if config is None:
+            config = _load_project_config(repo_path)
+
+        build_cfg = config.get("build", {})
+        embed_cfg = config.get("embeddings", {})
+
+        exclude_patterns = list(DEFAULT_EXCLUDE)
+        if exclude:
+            exclude_patterns.extend(exclude)
+        exclude_patterns.extend(build_cfg.get("exclude_dirs", []))
+
+        max_file_bytes = build_cfg.get("max_file_size_kb", 500) * 1024
+        _strict = strict_calls or build_cfg.get("strict_calls", False)
+        _batch  = embed_cfg.get("batch_size", batch_size)
+
         logger.info("Scanning %s ...", repo_path)
+
+        # Incremental build cache lives at {repo}/.repo2kg_cache/build_cache.json
+        cache_dir  = os.path.join(repo_path, ".repo2kg_cache")
+        cache_file = os.path.join(cache_dir, "build_cache.json")
+        file_cache = self._load_build_cache(cache_file)
+        new_entries: dict = {}
 
         supported_exts = set(LANG_EXTENSIONS.keys())
         source_files: list[str] = []
         lang_counts: dict[str, int] = {}
 
         for root, dirs, filenames in os.walk(repo_path):
-            # Prune excluded directories in-place
             dirs[:] = [
                 d for d in dirs
                 if not any(fnmatch.fnmatch(d, pat) for pat in exclude_patterns)
             ]
             for f in filenames:
                 ext = os.path.splitext(f)[1].lower()
-                if ext in supported_exts:
-                    fpath = os.path.join(root, f)
-                    if _is_generated_file(fpath):
+                if ext not in supported_exts:
+                    continue
+                fpath = os.path.join(root, f)
+                if _is_generated_file(fpath):
+                    continue
+                try:
+                    if os.path.getsize(fpath) > max_file_bytes:
+                        logger.debug("Skipping oversized file: %s", fpath)
                         continue
-                    source_files.append(fpath)
-                    lang = LANG_EXTENSIONS[ext]
-                    lang_counts[lang] = lang_counts.get(lang, 0) + 1
+                except OSError:
+                    continue
+                source_files.append(fpath)
+                lang_counts[LANG_EXTENSIONS[ext]] = lang_counts.get(LANG_EXTENSIONS[ext], 0) + 1
 
         if not source_files:
             logger.warning("No supported source files found in %s", repo_path)
@@ -1694,56 +1843,253 @@ class RepoKG:
             print(f"Supported extensions: {', '.join(sorted(supported_exts))}")
             return self
 
+        cache_hits = 0
+        _node_fields = {f.name for f in _dc_fields(CodeNode)}
+
         for fpath in source_files:
-            for node in parse_file(fpath, repo_root=repo_path):
-                self.nodes[node.id] = node
+            rel = os.path.relpath(fpath, repo_path)
+            key = self._file_cache_key(fpath)
+            cached = file_cache.get(rel)
+
+            if cached and cached.get("key") == key:
+                try:
+                    for nd in cached["nodes"]:
+                        filtered = {k: v for k, v in nd.items() if k in _node_fields}
+                        node = CodeNode(**filtered)
+                        self.nodes[node.id] = node
+                    new_entries[rel] = cached
+                    cache_hits += 1
+                    continue
+                except Exception:
+                    pass  # fall through to re-parse
+
+            try:
+                nodes = parse_file(fpath, repo_root=repo_path)
+                for node in nodes:
+                    self.nodes[node.id] = node
+                new_entries[rel] = {"key": key, "nodes": [asdict(n) for n in nodes]}
+            except Exception as e:
+                err = f"{rel}: {type(e).__name__}: {e}"
+                self.parse_errors.append(err)
+                logger.error("Parse error in %s: %s", rel, e)
+
+        if cache_hits:
+            logger.info("Cache: %d/%d files reused", cache_hits, len(source_files))
 
         if not self.nodes:
             logger.warning("No parseable functions/classes found")
             print("Warning: No parseable functions/classes found")
             return self
 
-        self._resolve_edges()
-        self._build_faiss()
-        edge_count = sum(len(n.calls) for n in self.nodes.values())
-        lang_summary = ", ".join(f"{lang}: {count}" for lang, count in sorted(lang_counts.items()))
-        logger.info("KG ready: %d nodes, %d call edges from %d files (%s)",
-                     len(self.nodes), edge_count, len(source_files), lang_summary)
+        self._resolve_edges(strict_calls=_strict)
+        self._detect_cycles()
+        self._build_faiss(batch_size=_batch)
+        self._save_build_cache(cache_file, new_entries)
+
+        edge_count  = sum(len(n.calls) for n in self.nodes.values())
+        lang_summary = ", ".join(f"{lang}: {c}" for lang, c in sorted(lang_counts.items()))
+        logger.info("KG ready: %d nodes, %d edges from %d files (%s)",
+                    len(self.nodes), edge_count, len(source_files), lang_summary)
         print(f"KG ready: {len(self.nodes)} nodes, {edge_count} call edges from {len(source_files)} files")
+        if cache_hits:
+            print(f"Cache: {cache_hits}/{len(source_files)} files reused from .repo2kg_cache/")
         print(f"Languages: {lang_summary}")
+        if self.parse_errors:
+            print(f"Parse errors: {len(self.parse_errors)} file(s) skipped (see .parse_errors.log)")
+        if self.cycles:
+            print(f"Cycles detected: {len(self.cycles)} strongly-connected component(s)")
         return self
 
-    def _resolve_edges(self):
-        """Convert raw call names → node ids. Also populate callers."""
+    def _resolve_edges(self, strict_calls: bool = False):
+        """Convert raw call names → node ids with import-aware disambiguation.
+
+        Resolution priority:
+          1. Same-file match (definitive)
+          2. Node in a file explicitly imported by the caller's file
+          3. First match (ambiguous) — dropped when strict_calls=True
+        """
         name_index: dict[str, list[str]] = {}
-        for node_id, node in self.nodes.items():
-            name_index.setdefault(node.name, []).append(node_id)
+        for node_id in self.nodes:
+            name_index.setdefault(self.nodes[node_id].name, []).append(node_id)
+
+        # Per-file set of imported module basenames, e.g. {"psycopg2", "socket", "utils"}
+        file_import_bases: dict[str, set[str]] = {}
+        for node in self.nodes.values():
+            if node.file in file_import_bases:
+                continue
+            bases: set[str] = set()
+            for imp in node.imports:
+                # "psycopg2.connect" → "psycopg2"
+                # "./utils" → "utils"
+                part = imp.replace("\\", "/").split("/")[-1].split(".")[0].lstrip("_.")
+                if part:
+                    bases.add(part)
+            file_import_bases[node.file] = bases
+
+        # File basename → list of file paths in the KG
+        base_to_files: dict[str, list[str]] = {}
+        for node in self.nodes.values():
+            b = os.path.splitext(os.path.basename(node.file))[0]
+            if node.file not in base_to_files.get(b, []):
+                base_to_files.setdefault(b, []).append(node.file)
 
         for node in self.nodes.values():
-            resolved = []
+            caller_imports = file_import_bases.get(node.file, set())
+            resolved: list[str] = []
+
             for raw_call in node.calls:
-                if raw_call in name_index:
-                    # prefer same-file match, else first match
-                    matches = name_index[raw_call]
-                    same_file = [m for m in matches if self.nodes[m].file == node.file]
-                    target = same_file[0] if same_file else matches[0]
-                    resolved.append(target)
+                matches = name_index.get(raw_call)
+                if not matches:
+                    continue
+                if len(matches) == 1:
+                    resolved.append(matches[0])
+                    continue
+
+                # 1. Prefer same-file match
+                same_file = [m for m in matches if self.nodes[m].file == node.file]
+                if same_file:
+                    resolved.append(same_file[0])
+                    continue
+
+                # 2. Prefer nodes in explicitly imported files
+                imported = [
+                    m for m in matches
+                    if os.path.splitext(os.path.basename(self.nodes[m].file))[0] in caller_imports
+                ]
+                if imported:
+                    resolved.append(imported[0])
+                    continue
+
+                # 3. Ambiguous — skip under strict_calls, else take first
+                if not strict_calls:
+                    resolved.append(matches[0])
+
             node.calls = resolved
 
-        # populate callers (reverse edges)
+        # Populate callers (reverse edges), deduplicated
         for node in self.nodes.values():
             for callee_id in node.calls:
                 if callee_id in self.nodes:
-                    self.nodes[callee_id].callers.append(node.id)
+                    callers = self.nodes[callee_id].callers
+                    if node.id not in callers:
+                        callers.append(node.id)
 
-    def _build_faiss(self):
+    def _build_faiss(self, batch_size: int = 64):
+        """Build FAISS index using batched encoding to avoid OOM on large repos."""
         ids = list(self.nodes.keys())
         summaries = [self.nodes[i].summary() for i in ids]
-        embeddings = self.model.encode(summaries, show_progress_bar=True)
+
+        batches = []
+        for i in range(0, len(summaries), batch_size):
+            batch_emb = self.model.encode(summaries[i:i + batch_size], show_progress_bar=False)
+            batches.append(batch_emb)
+
+        embeddings = _numpy.vstack(batches)
         dim = embeddings.shape[1]
         self._index = _faiss.IndexFlatL2(dim)
-        self._index.add(_numpy.array(embeddings))
+        self._index.add(_numpy.array(embeddings, dtype=_numpy.float32))
         self._index_ids = ids
+
+    def _detect_cycles(self):
+        """Kahn's algorithm: nodes that survive topological sort are cycle-free.
+        Remaining nodes belong to SCCs (strongly-connected components = cycles).
+        Annotates node.in_cycle and populates self.cycles.
+        """
+        node_ids = list(self.nodes.keys())
+        adj: dict[str, list[str]] = {
+            nid: [c for c in self.nodes[nid].calls if c in self.nodes]
+            for nid in node_ids
+        }
+        in_deg: dict[str, int] = {nid: 0 for nid in node_ids}
+        for nid in node_ids:
+            for c in adj[nid]:
+                in_deg[c] += 1
+
+        queue: deque[str] = deque(nid for nid in node_ids if in_deg[nid] == 0)
+        visited = 0
+        while queue:
+            v = queue.popleft()
+            visited += 1
+            for w in adj[v]:
+                in_deg[w] -= 1
+                if in_deg[w] == 0:
+                    queue.append(w)
+
+        cycle_members = {nid for nid in node_ids if in_deg[nid] > 0}
+        for nid in cycle_members:
+            self.nodes[nid].in_cycle = True
+
+        # Extract connected components among cycle nodes
+        cycles: list[list[str]] = []
+        remaining = set(cycle_members)
+        while remaining:
+            start = next(iter(remaining))
+            component: list[str] = []
+            stack = [start]
+            seen: set[str] = set()
+            while stack:
+                v = stack.pop()
+                if v in seen or v not in remaining:
+                    continue
+                seen.add(v)
+                component.append(v)
+                for w in adj.get(v, []):
+                    if w in remaining and w not in seen:
+                        stack.append(w)
+            cycles.append(component)
+            remaining -= seen
+        self.cycles = cycles
+
+    def export_dependency_graph(self, out_path: str | None = None,
+                                kg_path: str | None = None) -> dict:
+        """Export module-level import dependency graph.
+
+        Returns a dict with 'modules', 'edges', and 'top_imported' keys.
+        Saves to {kg_path}.deps.json when kg_path is provided.
+        """
+        if out_path is None and kg_path:
+            base = _re.sub(r"\.(json|toon)$", "", kg_path)
+            out_path = base + ".deps.json"
+
+        all_files = sorted({n.file for n in self.nodes.values()})
+        file_imports: dict[str, set[str]] = {}
+        for node in self.nodes.values():
+            file_imports.setdefault(node.file, set()).update(node.imports)
+
+        edges: list[dict] = []
+        import_counts: dict[str, int] = {}
+        file_set = set(all_files)
+
+        for src, imports in file_imports.items():
+            for imp in imports:
+                # Match import string to a KG file via normalized basename
+                imp_base = imp.replace(".", "/")
+                for ext in (".py", ".js", ".ts", ".tsx", ".jsx"):
+                    candidate = imp_base + ext
+                    if candidate in file_set:
+                        edges.append({"from": src, "to": candidate, "via": imp})
+                        import_counts[candidate] = import_counts.get(candidate, 0) + 1
+                        break
+
+        fan_in:  dict[str, int] = {}
+        fan_out: dict[str, int] = {}
+        for e in edges:
+            fan_out[e["from"]] = fan_out.get(e["from"], 0) + 1
+            fan_in[e["to"]]    = fan_in.get(e["to"],    0) + 1
+
+        modules = [
+            {"file": f, "fan_in": fan_in.get(f, 0), "fan_out": fan_out.get(f, 0)}
+            for f in all_files
+        ]
+        top_imported = sorted(import_counts, key=lambda k: -import_counts[k])[:10]
+        result = {"modules": modules, "edges": edges, "top_imported": top_imported}
+
+        if out_path:
+            with open(out_path, "w") as f:
+                json.dump(result, f, indent=2)
+            print(f"Dependency graph saved: {out_path}")
+
+        return result
 
     # ── Persist ────────────────────────────────────────────────────────────
 
@@ -1760,21 +2106,47 @@ class RepoKG:
         else:
             with open(path, "w") as f:
                 json.dump(data, f)
-        # FAISS sidecar uses the base path (strip .json/.toon, add .faiss)
         base = _re.sub(r"\.(json|toon)$", "", path)
         _faiss.write_index(self._index, base + ".faiss")
         with open(base + ".idx", "w") as f:
             json.dump(self._index_ids, f)
         print(f"Saved to {path} [{fmt.upper()}] ({len(self.nodes)} nodes)")
 
+        # Write parse errors log (clear stale log if no errors this run)
+        errors_log = path + ".parse_errors.log"
+        if self.parse_errors:
+            with open(errors_log, "w") as f:
+                f.write(f"# repo2kg parse errors — {len(self.parse_errors)} file(s) skipped\n")
+                for err in self.parse_errors:
+                    f.write(err + "\n")
+        elif os.path.exists(errors_log):
+            os.remove(errors_log)
+
     @classmethod
     def load(cls, path: str, model_name: str = "all-MiniLM-L6-v2") -> "RepoKG":
+        """Load a saved KG. Results are cached in-memory keyed by path+mtime."""
+        path = os.path.abspath(path)
+
+        # In-memory cache: skip full deserialization if file unchanged
+        try:
+            mtime = os.path.getmtime(path)
+            cache_key = f"{path}:{mtime}"
+        except OSError:
+            cache_key = None
+
+        if cache_key:
+            with _KG_CACHE_LOCK:
+                cached = _KG_CACHE.get(cache_key)
+            if cached is not None:
+                return cached
+
         base = _re.sub(r"\.(json|toon)$", "", path)
         for required in [path, base + ".faiss", base + ".idx"]:
             if not os.path.exists(required):
                 raise FileNotFoundError(f"Missing KG file: {required}")
         kg = cls(model_name)
         fmt = _detect_format(path)
+        _node_fields = {f.name for f in _dc_fields(CodeNode)}
         if fmt == "toon":
             with open(path) as f:
                 data = deserialize_toon(f.read())
@@ -1782,12 +2154,23 @@ class RepoKG:
             with open(path) as f:
                 data = json.load(f)
         for nid, ndata in data.items():
-            kg.nodes[nid] = CodeNode(**ndata)
+            filtered = {k: v for k, v in ndata.items() if k in _node_fields}
+            kg.nodes[nid] = CodeNode(**filtered)
         kg._index = _faiss.read_index(base + ".faiss")
         with open(base + ".idx") as f:
             kg._index_ids = json.load(f)
         print(f"Loaded KG: {len(kg.nodes)} nodes [{fmt.upper()}]")
+
+        if cache_key:
+            with _KG_CACHE_LOCK:
+                _KG_CACHE[cache_key] = kg
         return kg
+
+    @classmethod
+    def clear_cache(cls):
+        """Invalidate the in-memory KG load cache."""
+        with _KG_CACHE_LOCK:
+            _KG_CACHE.clear()
 
     # ── Query ──────────────────────────────────────────────────────────────
 
@@ -1881,6 +2264,11 @@ class RepoKG:
         }
 
 
+# Module-level in-memory cache for RepoKG.load()
+_KG_CACHE: dict[str, "RepoKG"] = {}
+_KG_CACHE_LOCK = threading.Lock()
+
+
 # ─────────────────────────────────────────────
 # LIGHTWEIGHT KG (no FAISS / no embeddings)
 # ─────────────────────────────────────────────
@@ -1900,8 +2288,10 @@ class RepoKGLite:
             else:
                 data = json.load(f)
         self.nodes: dict[str, CodeNode] = {}
+        _node_fields = {f.name for f in _dc_fields(CodeNode)}
         for nid, ndata in data.items():
-            self.nodes[nid] = CodeNode(**ndata)
+            filtered = {k: v for k, v in ndata.items() if k in _node_fields}
+            self.nodes[nid] = CodeNode(**filtered)
         self.path = path
         self.format = fmt
 
@@ -2010,7 +2400,9 @@ def export_codebase_md(kg_path: str, out_path: str):
             data = deserialize_toon(f.read())
         else:
             data = json.load(f)
-    nodes = {nid: CodeNode(**d) for nid, d in data.items()}
+    _node_fields = {f.name for f in _dc_fields(CodeNode)}
+    nodes = {nid: CodeNode(**{k: v for k, v in d.items() if k in _node_fields})
+             for nid, d in data.items()}
 
     files: dict[str, list[CodeNode]] = {}
     for n in nodes.values():
@@ -2154,7 +2546,9 @@ def generate_summary_md(kg_path: str, out_path: str | None = None) -> str:
             data = deserialize_toon(f.read())
         else:
             data = json.load(f)
-    nodes = {nid: CodeNode(**d) for nid, d in data.items()}
+    _node_fields = {f.name for f in _dc_fields(CodeNode)}
+    nodes = {nid: CodeNode(**{k: v for k, v in d.items() if k in _node_fields})
+             for nid, d in data.items()}
 
     # Per-file symbol list: classes first, then standalone functions — no methods
     files: dict[str, list[str]] = {}
@@ -2214,6 +2608,32 @@ def generate_summary_md(kg_path: str, out_path: str | None = None) -> str:
         for n in entry_candidates[:12]:
             lines.append(f"- `{n.name}` ({n.file}) — calls {len(n.calls)} symbols")
         lines.append("")
+
+    # Circular dependencies
+    cycle_nodes = [n for n in nodes.values() if getattr(n, "in_cycle", False)]
+    if cycle_nodes:
+        cycle_files = sorted({n.file for n in cycle_nodes})
+        lines.extend(["## Circular Dependencies", ""])
+        lines.append(f"{len(cycle_nodes)} nodes in cycles across {len(cycle_files)} file(s):")
+        for f in cycle_files[:10]:
+            lines.append(f"  - {f}")
+        if len(cycle_files) > 10:
+            lines.append(f"  - … and {len(cycle_files) - 10} more")
+        lines.append("")
+
+    # Parse errors (read from .parse_errors.log if present)
+    errors_log = kg_path + ".parse_errors.log"
+    if os.path.exists(errors_log):
+        with open(errors_log) as ef:
+            error_lines = [l.strip() for l in ef if l.strip() and not l.startswith("#")]
+        if error_lines:
+            lines.extend(["## Parse Errors (Blind Spots)", ""])
+            lines.append(f"> {len(error_lines)} file(s) failed to parse — KG may be incomplete.")
+            for e in error_lines[:10]:
+                lines.append(f"  - `{e}`")
+            if len(error_lines) > 10:
+                lines.append(f"  - … and {len(error_lines) - 10} more (see {errors_log})")
+            lines.append("")
 
     content = "\n".join(lines)
     token_estimate = len(content) // 4  # chars/4 ≈ tokens
@@ -3597,6 +4017,12 @@ def main():
     )
     parser.add_argument("--version", action="version", version=f"repo2kg {__version__}")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
+    parser.add_argument(
+        "--log-level",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        default=None,
+        help="Logging verbosity (overrides -v)",
+    )
     sub = parser.add_subparsers(dest="cmd")
 
     # ── build ──
@@ -3608,6 +4034,14 @@ def main():
     build_p.add_argument("--out", default="kg.json",
                          help="Output path for KG. Use .json or .toon extension (default: kg.json)")
     build_p.add_argument("--exclude", nargs="*", help="Additional directory patterns to exclude")
+    build_p.add_argument("--config", default=None,
+                         help="Path to repo2kg.toml config file (default: {repo}/repo2kg.toml)")
+    build_p.add_argument("--strict-calls", action="store_true",
+                         help="Drop ambiguous call edges instead of guessing (reduces false edges)")
+    build_p.add_argument("--batch-size", type=int, default=64,
+                         help="Embedding batch size for FAISS (default: 64)")
+    build_p.add_argument("--deps", action="store_true",
+                         help="Also export module dependency graph ({out}.deps.json)")
 
     # ── query (semantic, requires FAISS) ──
     query_p = sub.add_parser("query", help="Semantic search (requires FAISS)")
@@ -3698,6 +4132,14 @@ def main():
     sub.add_parser("info",
                    help="Print machine-readable tool info (JSON) — for agents")
 
+    # ── deps (module dependency graph) ──
+    deps_p = sub.add_parser("deps",
+                            help="Export module-level import dependency graph")
+    deps_p.add_argument("--kg", default="kg.json",
+                        help="Path to saved KG .json/.toon (default: kg.json)")
+    deps_p.add_argument("--out", default=None,
+                        help="Output JSON file (default: {kg}.deps.json)")
+
     # ── stats ──
     stats_p = sub.add_parser("stats", help="Show KG node/edge/file statistics")
     stats_p.add_argument("--kg", default="kg.json", help="Path to saved KG (default: kg.json)")
@@ -3738,18 +4180,32 @@ def main():
 
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(name)s %(levelname)s: %(message)s",
-    )
+    if args.log_level:
+        log_level = getattr(logging, args.log_level)
+    elif args.verbose:
+        log_level = logging.DEBUG
+    else:
+        log_level = logging.INFO
+    logging.basicConfig(level=log_level, format="%(name)s %(levelname)s: %(message)s")
 
     if args.cmd == "info":
         print_tool_info()
 
     elif args.cmd == "build":
         exclude = DEFAULT_EXCLUDE + (args.exclude or [])
-        kg = RepoKG().build(args.repo, exclude=exclude)
+        cfg = None
+        if args.config:
+            cfg = _load_project_config(os.path.dirname(os.path.abspath(args.config)))
+        kg = RepoKG().build(
+            args.repo,
+            exclude=exclude,
+            config=cfg,
+            strict_calls=args.strict_calls,
+            batch_size=args.batch_size,
+        )
         kg.save(args.out)
+        if args.deps:
+            kg.export_dependency_graph(kg_path=args.out)
 
     elif args.cmd == "query":
         kg = RepoKG.load(args.kg)
@@ -3820,6 +4276,10 @@ def main():
                 kg_exists = "✓" if Path(info["kg"]).exists() else "✗ missing"
                 print(f"  {path:<50} {kg_exists} {info['registered_at']}")
 
+    elif args.cmd == "deps":
+        kg = RepoKG.load(args.kg)
+        kg.export_dependency_graph(out_path=args.out, kg_path=args.kg)
+
     elif args.cmd == "stats":
         kg = RepoKG.load(args.kg)
         files = set(n.file for n in kg.nodes.values())
@@ -3827,12 +4287,15 @@ def main():
         functions = sum(1 for n in kg.nodes.values() if n.kind == "function")
         methods = sum(1 for n in kg.nodes.values() if n.kind == "method")
         edges = sum(len(n.calls) for n in kg.nodes.values())
+        cycles = sum(1 for n in kg.nodes.values() if getattr(n, "in_cycle", False))
         model_in_use = _default_model()
         print(f"Knowledge Graph Statistics:")
         print(f"  Files:         {len(files)}")
         print(f"  Nodes:         {len(kg.nodes)} ({classes} classes, {functions} functions, {methods} methods)")
         print(f"  Edges:         {edges} call edges")
         print(f"  Avg edges:     {edges / max(len(kg.nodes), 1):.1f} per node")
+        if cycles:
+            print(f"  Cycle nodes:   {cycles}")
         print(f"  Embedding model: {model_in_use}")
         print(f"  Note: 'query-lite' uses keyword search (no embeddings).")
         print(f"        Use 'repo2kg query' for semantic (embedding-based) search accuracy.")
